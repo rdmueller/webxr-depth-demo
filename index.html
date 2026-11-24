@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiefen-Demo: WebXR Depth Sensing</title>
+<style>
+  :root { --bg:#0e1316; --card:#182026; --line:#2a363e; --text:#e6edf0; --dim:#93a3ad; --acc:#2fd3b5; --warn:#ffb454; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  h2 { font-size:1rem; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
+  p { margin:0 0 12px; color:var(--dim); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:16px; }
+  ul.checks { list-style:none; margin:0; padding:0; }
+  ul.checks li { padding:4px 0; display:flex; gap:10px; }
+  ul.checks .dot { width:1.2em; text-align:center; }
+  .ok { color:var(--acc); } .no { color:var(--bad); } .wait { color:var(--warn); }
+  button { font:inherit; font-weight:600; color:var(--bg); background:var(--acc); border:0; border-radius:10px; padding:12px 16px; min-height:48px; cursor:pointer; }
+  button.sec { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  #viewer { width:100%; aspect-ratio:4/3; display:block; border-radius:8px; background:#070a0c; touch-action:none; }
+  #info { margin:10px 0; color:var(--dim); font-variant-numeric:tabular-nums; }
+  #msg { color:var(--warn); margin-top:10px; min-height:1.5em; }
+  code { background:#0a0e10; padding:1px 5px; border-radius:4px; font-size:.9em; }
+
+  /* AR overlay (DOM overlay root) */
+  #ar { display:none; }
+  #ar.on { display:block; position:fixed; inset:0; background:transparent; color:#fff; }
+  #ar .top { position:absolute; top:0; left:0; right:0; padding:16px; text-align:center; text-shadow:0 1px 4px #000; }
+  #dist { font-size:2.6rem; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.1; }
+  #hint { font-size:.95rem; }
+  #cross { position:absolute; left:50%; top:50%; width:28px; height:28px; margin:-14px 0 0 -14px; border:2px solid #fff; border-radius:50%; box-shadow:0 0 4px #000; }
+  #cross::after { content:""; position:absolute; left:50%; top:50%; width:4px; height:4px; margin:-2px 0 0 -2px; background:#fff; border-radius:50%; }
+  #ar .bottom { position:absolute; left:0; right:0; bottom:0; padding:16px; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  #ar button { background:rgba(14,19,22,.8); color:#fff; border:1px solid rgba(255,255,255,.35); }
+  #ar button.active { background:var(--acc); color:#06211c; border-color:var(--acc); }
+  #bScan { grid-column:1 / -1; }
+  #arCount { grid-column:1 / -1; text-align:center; text-shadow:0 1px 4px #000; font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tiefe aus der Handykamera</h1>
+  <p>WebXR Depth Sensing in Chrome für Android: Abstand messen, Tiefenbild ansehen, Raum als Punktwolke scannen.</p>
+
+  <section>
+    <h2>Kann dieses Gerät das?</h2>
+    <ul class="checks">
+      <li><span class="dot wait" id="c1">…</span><span>Sichere Verbindung (HTTPS oder localhost)</span></li>
+      <li><span class="dot wait" id="c2">…</span><span>WebXR im Browser vorhanden</span></li>
+      <li><span class="dot wait" id="c3">…</span><span>AR-Session (<code>immersive-ar</code>) möglich</span></li>
+    </ul>
+    <div class="row" style="margin-top:14px">
+      <button id="bStart" disabled>AR-Scan starten</button>
+      <button id="bSample" class="sec">Beispiel-Punktwolke laden</button>
+    </div>
+    <div id="msg"></div>
+  </section>
+
+  <section>
+    <h2>Punktwolke</h2>
+    <canvas id="viewer"></canvas>
+    <div id="info">Noch keine Punkte.</div>
+    <div class="row">
+      <button id="bPly" disabled>Als PLY speichern</button>
+      <button id="bClear" class="sec" disabled>Verwerfen</button>
+    </div>
+    <p style="margin-top:12px">Ziehen dreht, Zwei-Finger-Geste oder Mausrad zoomt. Die Farbe zeigt die Höhe.</p>
+  </section>
+</main>
+
+<div id="ar">
+  <div class="top">
+    <div id="dist">–</div>
+    <div id="hint">Handy langsam seitlich bewegen …</div>
+  </div>
+  <div id="cross"></div>
+  <div class="bottom">
+    <div id="arCount">0 Punkte</div>
+    <button id="bScan">Scan starten</button>
+    <button id="bDepth" class="active">Tiefenbild</button>
+    <button id="bFlip">Tiefe spiegeln</button>
+    <button id="bEnd" style="grid-column:1 / -1">Beenden</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+// ---------- Konfiguration ----------
+const MAX_POINTS = 300000;
+const MIN_RANGE = 0.2, MAX_RANGE = 4.0;      // Meter
+const LIVE_COLS = 40, SCAN_COLS = 72;
+const CAPTURE_MOVE = 0.06, CAPTURE_TURN = 0.10, CAPTURE_MS = 150; // m, rad, ms
+
+// ---------- Zustand ----------
+const cloudPos = new Float32Array(MAX_POINTS * 3);
+const cloudCol = new Uint8Array(MAX_POINTS * 3);
+let count = 0, uploaded = 0, synthetic = false;
+let session = null, refSpace = null;
+let scanning = false, showDepth = true, flipY = false;
+let lastCap = null;
+const cam = { yaw: 0.6, pitch: 0.35, dist: 3, cx: 0, cy: 0, cz: 0 };
+
+// ---------- Mathe (4x4, spaltenweise) ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  return o;
+}
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), o = new Float32Array(16);
+  o[0] = f / aspect; o[5] = f; o[10] = (far + near) / (near - far); o[11] = -1; o[14] = 2 * far * near / (near - far);
+  return o;
+}
+function lookAt(ex, ey, ez, cx, cy, cz) {
+  let zx = ex - cx, zy = ey - cy, zz = ez - cz; let l = Math.hypot(zx, zy, zz) || 1; zx /= l; zy /= l; zz /= l;
+  let xx = zz, xy = 0, xz = -zx; l = Math.hypot(xx, xy, xz) || 1; xx /= l; xz /= l;       // up(0,1,0) × z
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx*ex + xy*ey + xz*ez), -(yx*ex + yy*ey + yz*ez), -(zx*ex + zy*ey + zz*ez), 1]);
+}
+function hue(h) {
+  const f = n => { const k = (n + h / 30) % 12; return 0.5 - 0.5 * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return [f(0), f(8), f(4)];
+}
+const clamp01 = t => Math.min(1, Math.max(0, t));
+
+// ---------- WebGL ----------
+const canvas = $('viewer');
+const gl = canvas.getContext('webgl', { xrCompatible: !!navigator.xr, antialias: true, alpha: true });
+let prog, loc, bufCP, bufCC, bufLP, bufLC;
+const livePos = new Float32Array(LIVE_COLS * 140 * 3), liveCol = new Uint8Array(LIVE_COLS * 140 * 3);
+
+function initGL() {
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, `
+    attribute vec3 aPos; attribute vec3 aCol;
+    uniform mat4 uVP; uniform float uSize; uniform float uAtten;
+    varying vec3 vCol;
+    void main() {
+      gl_Position = uVP * vec4(aPos, 1.0);
+      gl_PointSize = mix(uSize, clamp(uSize / max(gl_Position.w, 0.05), 2.0, 48.0), uAtten);
+      vCol = aCol;
+    }`));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    varying vec3 vCol; uniform float uAlpha;
+    void main() { gl_FragColor = vec4(vCol * uAlpha, uAlpha); }`));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  loc = { pos: gl.getAttribLocation(prog, 'aPos'), col: gl.getAttribLocation(prog, 'aCol'),
+    vp: gl.getUniformLocation(prog, 'uVP'), size: gl.getUniformLocation(prog, 'uSize'),
+    atten: gl.getUniformLocation(prog, 'uAtten'), alpha: gl.getUniformLocation(prog, 'uAlpha') };
+  bufCP = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufCP); gl.bufferData(gl.ARRAY_BUFFER, cloudPos.byteLength, gl.DYNAMIC_DRAW);
+  bufCC = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufCC); gl.bufferData(gl.ARRAY_BUFFER, cloudCol.byteLength, gl.DYNAMIC_DRAW);
+  bufLP = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufLP); gl.bufferData(gl.ARRAY_BUFFER, livePos.byteLength, gl.DYNAMIC_DRAW);
+  bufLC = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufLC); gl.bufferData(gl.ARRAY_BUFFER, liveCol.byteLength, gl.DYNAMIC_DRAW);
+  uploaded = 0;
+}
+
+function uploadCloud() {
+  if (uploaded > count) uploaded = 0;
+  if (uploaded === count) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufCP); gl.bufferSubData(gl.ARRAY_BUFFER, uploaded * 12, cloudPos.subarray(uploaded * 3, count * 3));
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufCC); gl.bufferSubData(gl.ARRAY_BUFFER, uploaded * 3, cloudCol.subarray(uploaded * 3, count * 3));
+  uploaded = count;
+}
+
+function drawPoints(bp, bc, n, vp, size, atten, alpha) {
+  if (!n) return;
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bp); gl.enableVertexAttribArray(loc.pos); gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bc); gl.enableVertexAttribArray(loc.col); gl.vertexAttribPointer(loc.col, 3, gl.UNSIGNED_BYTE, true, 0, 0);
+  gl.uniformMatrix4fv(loc.vp, false, vp); gl.uniform1f(loc.size, size); gl.uniform1f(loc.atten, atten); gl.uniform1f(loc.alpha, alpha);
+  gl.drawArrays(gl.POINTS, 0, n);
+}
+
+// ---------- Tiefe abtasten: Tiefenkarte -> 3D-Punkte in Weltkoordinaten ----------
+// mode 'live': Farbe = Abstand, mode 'scan': Farbe = Höhe
+function sample(depth, view, cols, rows, outPos, outCol, start, limit, mode) {
+  const P = view.projectionMatrix, M = view.transform.matrix;
+  let n = start;
+  for (let r = 0; r < rows && n < limit; r++) {
+    const y = (r + 0.5) / rows;
+    for (let c = 0; c < cols && n < limit; c++) {
+      const x = (c + 0.5) / cols;
+      const d = depth.getDepthInMeters(x, flipY ? 1 - y : y);
+      if (!(d > MIN_RANGE && d < MAX_RANGE)) continue;
+      // Rückprojektion: Bildpunkt + Tiefe -> Punkt im Kameraraum (Kamera blickt nach -z)
+      const vx = (2 * x - 1 + P[8]) * d / P[0];
+      const vy = (1 - 2 * y + P[9]) * d / P[5];
+      const vz = -d;
+      const wx = M[0]*vx + M[4]*vy + M[8]*vz + M[12];
+      const wy = M[1]*vx + M[5]*vy + M[9]*vz + M[13];
+      const wz = M[2]*vx + M[6]*vy + M[10]*vz + M[14];
+      const rgb = mode === 'live' ? hue(clamp01((d - MIN_RANGE) / (MAX_RANGE - MIN_RANGE)) * 240)
+                                  : hue(260 - clamp01((wy + 1.6) / 2.6) * 240);
+      outPos[n*3] = wx; outPos[n*3+1] = wy; outPos[n*3+2] = wz;
+      outCol[n*3] = rgb[0] * 255; outCol[n*3+1] = rgb[1] * 255; outCol[n*3+2] = rgb[2] * 255;
+      n++;
+    }
+  }
+  return n;
+}
+
+// ---------- AR-Session ----------
+async function startAR() {
+  $('msg').textContent = '';
+  const init = prefs => ({
+    requiredFeatures: ['depth-sensing', 'dom-overlay'],
+    domOverlay: { root: $('ar') },
+    depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: prefs }
+  });
+  try {
+    try { session = await navigator.xr.requestSession('immersive-ar', init(['luminance-alpha', 'float32'])); }
+    catch (e) { session = await navigator.xr.requestSession('immersive-ar', init([])); }
+    await gl.makeXRCompatible();
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    refSpace = await session.requestReferenceSpace('local');
+  } catch (e) {
+    if (session) { try { await session.end(); } catch (_) {} session = null; }
+    $('msg').textContent = 'AR-Start fehlgeschlagen: ' + (e && e.message ? e.message : e);
+    return;
+  }
+  if (synthetic) clearCloud();
+  uploaded = 0; scanning = false; lastCap = null;
+  $('bScan').textContent = 'Scan starten'; $('bScan').classList.remove('active');
+  $('ar').classList.add('on');
+  session.addEventListener('end', onEnd);
+  session.requestAnimationFrame(onXRFrame);
+}
+
+function onEnd() {
+  session = null; $('ar').classList.remove('on');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  uploaded = 0; fitCamera(); updateInfo();
+  requestAnimationFrame(drawViewer);
+}
+
+function onXRFrame(t, frame) {
+  if (!session) return;
+  session.requestAnimationFrame(onXRFrame);
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const pose = frame.getViewerPose(refSpace);
+  if (!pose) return;
+  const view = pose.views[0], vp = layer.getViewport(view);
+  gl.viewport(vp.x, vp.y, vp.width, vp.height);
+  const VP = mul(view.projectionMatrix, view.transform.inverse.matrix);
+  const aspect = vp.height / vp.width;
+
+  let depth = null;
+  try { depth = frame.getDepthInformation(view); } catch (e) { $('hint').textContent = 'Tiefe nicht lesbar: ' + e.message; }
+
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  if (depth) {
+    try {
+      const d = depth.getDepthInMeters(0.5, 0.5);
+      $('dist').textContent = d > 0 ? d.toFixed(2).replace('.', ',') + ' m' : '–';
+      $('hint').textContent = scanning ? 'Scan läuft: langsam um das Objekt gehen' : 'Abstand in der Bildmitte';
+
+      if (showDepth) {
+        const rows = Math.min(140, Math.round(LIVE_COLS * aspect));
+        const n = sample(depth, view, LIVE_COLS, rows, livePos, liveCol, 0, LIVE_COLS * 140, 'live');
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufLP); gl.bufferSubData(gl.ARRAY_BUFFER, 0, livePos.subarray(0, n * 3));
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufLC); gl.bufferSubData(gl.ARRAY_BUFFER, 0, liveCol.subarray(0, n * 3));
+        gl.disable(gl.DEPTH_TEST);
+        drawPoints(bufLP, bufLC, n, VP, vp.width / LIVE_COLS + 1, 0, 0.45);
+      }
+
+      if (scanning && count < MAX_POINTS) {
+        const p = view.transform.position, o = view.transform.orientation;
+        let take = !lastCap;
+        if (lastCap && t - lastCap.t > CAPTURE_MS) {
+          const moved = Math.hypot(p.x - lastCap.x, p.y - lastCap.y, p.z - lastCap.z);
+          const dot = Math.abs(o.x*lastCap.qx + o.y*lastCap.qy + o.z*lastCap.qz + o.w*lastCap.qw);
+          const turned = 2 * Math.acos(Math.min(1, dot));
+          take = moved > CAPTURE_MOVE || turned > CAPTURE_TURN;
+        }
+        if (take) {
+          count = sample(depth, view, SCAN_COLS, Math.round(SCAN_COLS * aspect), cloudPos, cloudCol, count, MAX_POINTS, 'scan');
+          lastCap = { t, x: p.x, y: p.y, z: p.z, qx: o.x, qy: o.y, qz: o.z, qw: o.w };
+          $('arCount').textContent = count.toLocaleString('de-DE') + ' Punkte' + (count >= MAX_POINTS ? ' (Speicher voll)' : '');
+        }
+      }
+    } catch (e) { $('hint').textContent = 'Fehler: ' + e.message; }
+  } else {
+    $('dist').textContent = '–';
+    $('hint').textContent = 'Handy langsam seitlich bewegen …';
+  }
+
+  uploadCloud();
+  gl.enable(gl.DEPTH_TEST);
+  drawPoints(bufCP, bufCC, count, VP, 14, 1, 1);
+}
+
+// ---------- 2D-Betrachter ----------
+function fitCamera() {
+  if (!count) return;
+  let sx = 0, sy = 0, sz = 0;
+  for (let i = 0; i < count; i++) { sx += cloudPos[i*3]; sy += cloudPos[i*3+1]; sz += cloudPos[i*3+2]; }
+  cam.cx = sx / count; cam.cy = sy / count; cam.cz = sz / count;
+  let r2 = 0; const step = Math.max(1, Math.floor(count / 20000));
+  for (let i = 0; i < count; i += step) {
+    const dx = cloudPos[i*3] - cam.cx, dy = cloudPos[i*3+1] - cam.cy, dz = cloudPos[i*3+2] - cam.cz;
+    r2 = Math.max(r2, dx*dx + dy*dy + dz*dz);
+  }
+  cam.dist = Math.max(0.5, Math.sqrt(r2) * 1.8);
+}
+
+function drawViewer() {
+  if (session) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0.027, 0.039, 0.047, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  uploadCloud();
+  const cp = Math.cos(cam.pitch);
+  const ex = cam.cx + cam.dist * cp * Math.sin(cam.yaw), ey = cam.cy + cam.dist * Math.sin(cam.pitch), ez = cam.cz + cam.dist * cp * Math.cos(cam.yaw);
+  const VP = mul(perspective(0.9, w / Math.max(1, h), 0.05, 100), lookAt(ex, ey, ez, cam.cx, cam.cy, cam.cz));
+  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST);
+  drawPoints(bufCP, bufCC, count, VP, 10 * dpr, 1, 1);
+}
+const redraw = () => requestAnimationFrame(drawViewer);
+
+function updateInfo() {
+  $('info').textContent = count
+    ? count.toLocaleString('de-DE') + ' Punkte' + (synthetic ? ' · synthetische Beispieldaten, kein echter Scan' : ' · gescannt')
+    : 'Noch keine Punkte.';
+  $('bPly').disabled = $('bClear').disabled = !count;
+}
+function clearCloud() { count = 0; uploaded = 0; synthetic = false; updateInfo(); redraw(); }
+
+// Bedienung: drehen und zoomen
+const ptrs = new Map(); let pinch = 0;
+canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); pinch = 0; });
+canvas.addEventListener('pointermove', e => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  if (ptrs.size === 1) {
+    cam.yaw -= (e.clientX - p.x) * 0.008;
+    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + (e.clientY - p.y) * 0.008));
+  }
+  p.x = e.clientX; p.y = e.clientY;
+  if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()], d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinch) cam.dist = Math.max(0.2, Math.min(50, cam.dist * pinch / d));
+    pinch = d;
+  }
+  redraw();
+});
+const up = e => { ptrs.delete(e.pointerId); pinch = 0; };
+canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist = Math.max(0.2, Math.min(50, cam.dist * Math.exp(e.deltaY * 0.001))); redraw(); }, { passive: false });
+window.addEventListener('resize', redraw);
+
+// ---------- Beispieldaten (synthetisch) ----------
+function loadSample() {
+  count = 0; uploaded = 0; synthetic = true;
+  const noise = () => (Math.random() - 0.5) * 0.02;
+  const add = (x, y, z) => {
+    if (count >= MAX_POINTS) return;
+    const rgb = hue(260 - clamp01((y + 1.6) / 2.6) * 240);
+    cloudPos[count*3] = x + noise(); cloudPos[count*3+1] = y + noise(); cloudPos[count*3+2] = z + noise();
+    cloudCol[count*3] = rgb[0] * 255; cloudCol[count*3+1] = rgb[1] * 255; cloudCol[count*3+2] = rgb[2] * 255; count++;
+  };
+  const s = 0.035;
+  for (let x = -1.5; x <= 1.5; x += s) for (let z = -3; z <= 0; z += s) add(x, -1.4, z);            // Boden
+  for (let x = -1.5; x <= 1.5; x += s) for (let y = -1.4; y <= 1; y += s) add(x, y, -3);            // Rückwand
+  for (let z = -3; z <= 0; z += s) for (let y = -1.4; y <= 1; y += s) add(-1.5, y, z);              // Seitenwand
+  for (let a = 0; a <= 0.6; a += s) for (let b = 0; b <= 0.6; b += s) {                             // Kiste
+    add(0.3 + a, -0.8, -2.2 + b); add(0.3 + a, -1.4 + b, -1.6); add(0.3, -1.4 + a, -2.2 + b);
+  }
+  for (let i = 0; i < 6000; i++) {                                                                  // Kugel
+    const u = Math.random() * 2 - 1, th = Math.random() * 6.2832, q = Math.sqrt(1 - u * u);
+    add(-0.6 + 0.3 * q * Math.cos(th), -1.1 + 0.3 * u, -1.5 + 0.3 * q * Math.sin(th));
+  }
+  fitCamera(); updateInfo(); redraw();
+}
+
+// ---------- PLY-Export (binär, Meter, y zeigt nach oben) ----------
+function savePLY() {
+  const head = new TextEncoder().encode(
+    'ply\nformat binary_little_endian 1.0\ncomment WebXR Depth Sensing Demo\n' +
+    'element vertex ' + count + '\nproperty float x\nproperty float y\nproperty float z\n' +
+    'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n');
+  const body = new DataView(new ArrayBuffer(count * 15));
+  for (let i = 0; i < count; i++) {
+    const o = i * 15;
+    body.setFloat32(o, cloudPos[i*3], true); body.setFloat32(o + 4, cloudPos[i*3+1], true); body.setFloat32(o + 8, cloudPos[i*3+2], true);
+    body.setUint8(o + 12, cloudCol[i*3]); body.setUint8(o + 13, cloudCol[i*3+1]); body.setUint8(o + 14, cloudCol[i*3+2]);
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([head, body.buffer], { type: 'application/octet-stream' }));
+  a.download = 'scan.ply'; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+// ---------- Start ----------
+function mark(id, state) { const e = $(id); e.textContent = state ? '✓' : '✗'; e.className = 'dot ' + (state ? 'ok' : 'no'); }
+async function checks() {
+  mark('c1', window.isSecureContext);
+  mark('c2', !!navigator.xr);
+  let ar = false;
+  if (navigator.xr) { try { ar = await navigator.xr.isSessionSupported('immersive-ar'); } catch (e) {} }
+  mark('c3', ar);
+  $('bStart').disabled = !ar;
+  if (!ar) $('msg').textContent = 'Hier läuft kein AR. Öffne die Seite über HTTPS in Chrome auf einem ARCore-fähigen Android-Handy. Die Beispiel-Punktwolke zeigt solange den Betrachter.';
+}
+
+$('bStart').onclick = startAR;
+$('bSample').onclick = loadSample;
+$('bPly').onclick = savePLY;
+$('bClear').onclick = clearCloud;
+$('bEnd').onclick = () => session && session.end();
+$('bScan').onclick = () => { scanning = !scanning; lastCap = null; $('bScan').textContent = scanning ? 'Scan pausieren' : 'Scan fortsetzen'; $('bScan').classList.toggle('active', scanning); };
+$('bDepth').onclick = () => { showDepth = !showDepth; $('bDepth').classList.toggle('active', showDepth); };
+$('bFlip').onclick = () => { flipY = !flipY; $('bFlip').classList.toggle('active', flipY); };
+
+if (gl) { initGL(); redraw(); } else { $('msg').textContent = 'WebGL ist nicht verfügbar.'; }
+checks();
+</script>
+</body>
+</html>
