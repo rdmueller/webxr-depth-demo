@@ -10,6 +10,7 @@
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
   main { max-width:720px; margin:0 auto; padding:20px 16px 48px; }
   h1 { font-size:1.5rem; margin:0 0 4px; }
+  #ver { font-size:.8rem; font-weight:400; color:var(--dim); white-space:nowrap; }
   h2 { font-size:1rem; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
   p { margin:0 0 12px; color:var(--dim); }
   section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:16px; }
@@ -43,7 +44,7 @@
 </head>
 <body>
 <main>
-  <h1>Tiefe aus der Handykamera</h1>
+  <h1>Tiefe aus der Handykamera <span id="ver"></span></h1>
   <p>WebXR Depth Sensing in Chrome für Android: Abstand messen, Tiefenbild ansehen, Raum scannen und als Punktwolke oder einfachen Gaussian Splat speichern.</p>
 
   <section>
@@ -95,9 +96,11 @@
 const $ = id => document.getElementById(id);
 
 // ---------- Konfiguration ----------
-const MAX_POINTS = 400000;
+const VERSION = '0.3.0';
+const MAX_POINTS = 2000000;
 const MIN_RANGE = 0.2, MAX_RANGE = 4.0;      // Meter
 const LIVE_COLS = 40, SCAN_COLS = 72;
+const VOXEL = 0.02;                           // Meter: ein Punkt pro Würfel dieser Kantenlänge
 const CAPTURE_MOVE = 0.06, CAPTURE_TURN = 0.10, CAPTURE_MS = 150; // m, rad, ms
 
 // ---------- Zustand ----------
@@ -106,6 +109,11 @@ const cloudCol = new Uint8Array(MAX_POINTS * 3);
 const cloudSize = new Float32Array(MAX_POINTS);   // Radius je Punkt in Metern, für den Splat
 let count = 0, uploaded = 0, synthetic = false, hasColor = false;
 let xrBinding = null, flipC = false;
+// Zwischenspeicher für eine Aufnahme und Voxel-Index des Scans (Voxel -> Punktnummer)
+const TMP_MAX = SCAN_COLS * 220;
+const tmpPos = new Float32Array(TMP_MAX * 3), tmpCol = new Uint8Array(TMP_MAX * 3), tmpSize = new Float32Array(TMP_MAX), tmpKey = new Float64Array(TMP_MAX);
+const voxels = new Map();
+const gain = [1, 1, 1];
 let session = null, refSpace = null;
 let scanning = false, showDepth = true, flipY = false;
 let lastCap = null;
@@ -238,7 +246,7 @@ function drawPoints(bp, bc, n, vp, size, atten, alpha) {
 
 // ---------- Tiefe abtasten: Tiefenkarte -> 3D-Punkte in Weltkoordinaten ----------
 // mode 'live': Farbe = Abstand. mode 'scan': Farbe = Kamerabild (pix), ohne Kamerabild = Höhe
-function sample(depth, view, cols, rows, outPos, outCol, start, limit, mode, pix) {
+function sample(depth, view, cols, rows, outPos, outCol, start, limit, mode, pix, outSize) {
   const P = view.projectionMatrix, M = view.transform.matrix;
   let n = start;
   for (let r = 0; r < rows && n < limit; r++) {
@@ -265,11 +273,47 @@ function sample(depth, view, cols, rows, outPos, outCol, start, limit, mode, pix
       }
       outPos[n*3] = wx; outPos[n*3+1] = wy; outPos[n*3+2] = wz;
       outCol[n*3] = cr; outCol[n*3+1] = cg; outCol[n*3+2] = cb;
-      if (mode === 'scan') cloudSize[n] = d * 2 / (P[0] * cols) * 0.7;   // Abstand der Abtastpunkte in dieser Entfernung
+      if (outSize) outSize[n] = d * 2 / (P[0] * cols) * 0.7;   // Abstand der Abtastpunkte in dieser Entfernung
       n++;
     }
   }
   return n;
+}
+
+// ---------- Aufnahme in den Scan einfügen ----------
+function voxelKey(x, y, z) {
+  const ix = Math.floor(x / VOXEL) + 1024, iy = Math.floor(y / VOXEL) + 1024, iz = Math.floor(z / VOXEL) + 1024;
+  if (ix < 0 || ix > 2047 || iy < 0 || iy > 2047 || iz < 0 || iz > 2047) return -1;   // weiter als ~20 m vom Start
+  return (ix * 2048 + iy) * 2048 + iz;
+}
+// 1. Belichtung angleichen: Wo die Aufnahme schon gescannte Voxel trifft, vergleicht sie ihre Farben
+//    mit den gespeicherten und gleicht die Helligkeit je Farbkanal an.
+// 2. Dubletten vermeiden: Nur Punkte in noch leeren Voxeln kommen neu dazu.
+function mergeCapture(m, colored) {
+  let n0 = 0, n1 = 0, n2 = 0, o0 = 0, o1 = 0, o2 = 0, overlap = 0;
+  for (let i = 0; i < m; i++) {
+    const k = tmpKey[i] = voxelKey(tmpPos[i*3], tmpPos[i*3+1], tmpPos[i*3+2]);
+    if (k < 0 || !colored) continue;
+    const j = voxels.get(k);
+    if (j === undefined) continue;
+    const r = tmpCol[i*3], g = tmpCol[i*3+1], b = tmpCol[i*3+2], R = cloudCol[j*3], G = cloudCol[j*3+1], B = cloudCol[j*3+2];
+    if (Math.max(r, g, b, R, G, B) > 245 || Math.min(r, g, b) < 10) continue;   // über- oder unterbelichtet: sagt nichts aus
+    n0 += r; n1 += g; n2 += b; o0 += R; o1 += G; o2 += B; overlap++;
+  }
+  if (overlap >= 200) {
+    gain[0] = Math.min(2.5, Math.max(0.4, o0 / Math.max(1, n0)));
+    gain[1] = Math.min(2.5, Math.max(0.4, o1 / Math.max(1, n1)));
+    gain[2] = Math.min(2.5, Math.max(0.4, o2 / Math.max(1, n2)));
+  }
+  for (let i = 0; i < m && count < MAX_POINTS; i++) {
+    const k = tmpKey[i];
+    if (k < 0 || voxels.has(k)) continue;
+    voxels.set(k, count);
+    cloudPos[count*3] = tmpPos[i*3]; cloudPos[count*3+1] = tmpPos[i*3+1]; cloudPos[count*3+2] = tmpPos[i*3+2];
+    for (let c = 0; c < 3; c++) cloudCol[count*3+c] = colored ? Math.min(255, tmpCol[i*3+c] * gain[c]) : tmpCol[i*3+c];
+    cloudSize[count] = tmpSize[i];
+    count++;
+  }
 }
 
 // ---------- AR-Session ----------
@@ -293,7 +337,7 @@ async function startAR() {
     $('msg').textContent = 'AR-Start fehlgeschlagen: ' + (e && e.message ? e.message : e);
     return;
   }
-  if (synthetic) clearCloud();
+  clearCloud();   // neue Session, neues Koordinatensystem: ein alter Scan würde nicht mehr passen
   uploaded = 0; scanning = false; lastCap = null;
   $('bScan').textContent = 'Scan starten'; $('bScan').classList.remove('active');
   $('ar').classList.add('on');
@@ -354,7 +398,8 @@ function onXRFrame(t, frame) {
           const pix = grabCamera(view, SCAN_COLS, rows);
           gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer); gl.viewport(vp.x, vp.y, vp.width, vp.height); gl.enable(gl.BLEND);
           if (!count) hasColor = !!pix;
-          count = sample(depth, view, SCAN_COLS, rows, cloudPos, cloudCol, count, MAX_POINTS, 'scan', pix);
+          const m = sample(depth, view, SCAN_COLS, rows, tmpPos, tmpCol, 0, TMP_MAX, 'scan', pix, tmpSize);
+          mergeCapture(m, !!pix);
           lastCap = { t, x: p.x, y: p.y, z: p.z, qx: o.x, qy: o.y, qz: o.z, qw: o.w };
           $('arCount').textContent = count.toLocaleString('de-DE') + ' Punkte' + (count >= MAX_POINTS ? ' (Speicher voll)' : '');
         }
@@ -408,7 +453,7 @@ function updateInfo() {
     : 'Noch keine Punkte.';
   $('bSplat').disabled = $('bPly').disabled = $('bClear').disabled = !count;
 }
-function clearCloud() { count = 0; uploaded = 0; synthetic = false; hasColor = false; updateInfo(); redraw(); }
+function clearCloud() { count = 0; uploaded = 0; synthetic = false; hasColor = false; voxels.clear(); gain[0] = gain[1] = gain[2] = 1; updateInfo(); redraw(); }
 
 // Bedienung: drehen und zoomen
 const ptrs = new Map(); let pinch = 0;
@@ -434,7 +479,7 @@ window.addEventListener('resize', redraw);
 
 // ---------- Beispieldaten (synthetisch) ----------
 function loadSample() {
-  count = 0; uploaded = 0; synthetic = true; hasColor = false;
+  count = 0; uploaded = 0; synthetic = true; hasColor = false; voxels.clear();
   const noise = () => (Math.random() - 0.5) * 0.02;
   const add = (x, y, z) => {
     if (count >= MAX_POINTS) return;
@@ -518,6 +563,7 @@ $('bDepth').onclick = () => { showDepth = !showDepth; $('bDepth').classList.togg
 $('bFlip').onclick = () => { flipY = !flipY; $('bFlip').classList.toggle('active', flipY); };
 $('bFlipC').onclick = () => { flipC = !flipC; $('bFlipC').classList.toggle('active', flipC); };
 
+$('ver').textContent = 'v' + VERSION;
 if (gl) { initGL(); redraw(); } else { $('msg').textContent = 'WebGL ist nicht verfügbar.'; }
 checks();
 </script>
