@@ -21,3 +21,7 @@ Eine einzelne `index.html` ohne Abhängigkeiten. Sie nutzt die WebXR Depth Sensi
 - **Splat** (`scan-splat.ply`): 3DGS-PLY-Format, y zeigt nach unten. Der Splat ist nicht trainiert: Jeder Scanpunkt wird ein runder Gaussian in Kamerafarbe.
 
 Die Kamerafarben brauchen die WebXR-Funktion `camera-access`. Ohne sie zeigt die Farbe die Höhe.
+
+## Version
+
+Die Seite zeigt ihre Version neben der Überschrift. Sie steht als `VERSION` in `index.html` und wird bei jeder Änderung von Hand erhöht.

@@ -10,6 +10,7 @@
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
   main { max-width:720px; margin:0 auto; padding:20px 16px 48px; }
   h1 { font-size:1.5rem; margin:0 0 4px; }
+  #ver { font-size:.8rem; font-weight:400; color:var(--dim); white-space:nowrap; }
   h2 { font-size:1rem; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
   p { margin:0 0 12px; color:var(--dim); }
   section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:16px; }
@@ -43,7 +44,7 @@
 </head>
 <body>
 <main>
-  <h1>Tiefe aus der Handykamera</h1>
+  <h1>Tiefe aus der Handykamera <span id="ver"></span></h1>
   <p>WebXR Depth Sensing in Chrome für Android: Abstand messen, Tiefenbild ansehen, Raum scannen und als Punktwolke oder einfachen Gaussian Splat speichern.</p>
 
   <section>
@@ -95,7 +96,8 @@
 const $ = id => document.getElementById(id);
 
 // ---------- Konfiguration ----------
-const MAX_POINTS = 400000;
+const VERSION = '0.3.0';
+const MAX_POINTS = 2000000;
 const MIN_RANGE = 0.2, MAX_RANGE = 4.0;      // Meter
 const LIVE_COLS = 40, SCAN_COLS = 72;
 const CAPTURE_MOVE = 0.06, CAPTURE_TURN = 0.10, CAPTURE_MS = 150; // m, rad, ms
@@ -518,6 +520,7 @@ $('bDepth').onclick = () => { showDepth = !showDepth; $('bDepth').classList.togg
 $('bFlip').onclick = () => { flipY = !flipY; $('bFlip').classList.toggle('active', flipY); };
 $('bFlipC').onclick = () => { flipC = !flipC; $('bFlipC').classList.toggle('active', flipC); };
 
+$('ver').textContent = 'v' + VERSION;
 if (gl) { initGL(); redraw(); } else { $('msg').textContent = 'WebGL ist nicht verfügbar.'; }
 checks();
 </script>
