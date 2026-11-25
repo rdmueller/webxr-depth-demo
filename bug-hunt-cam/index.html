@@ -54,7 +54,13 @@
   .note { color: #b9a6dc; font-size: 9px; }
   #tools { position: fixed; right: 10px; bottom: 10px; z-index: 3; display: flex; gap: 10px; }
   #tools[hidden] { display: none; }
-  #tools button { font-size: 9px; padding: 10px 12px; opacity: .85; }
+  #tools { flex-wrap: wrap; justify-content: flex-end; left: 10px; }
+  #infobox { position: fixed; inset: 0; z-index: 4; box-sizing: border-box; padding: 16px; background: rgba(17, 10, 48, .94);
+             display: flex; flex-direction: column; gap: 14px; }
+  #infobox[hidden] { display: none; }
+  #infotext { flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+              font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: var(--ink); }
+  #tools button { font-size: 8px; padding: 10px 9px; opacity: .85; }
 </style>
 </head>
 <body>
@@ -67,7 +73,7 @@
     <h1>BUG HUNT CAM</h1>
     <p>Die Webcam macht dich zur Pixel-Figur. Die Seite erkennt deine Hände, dein Gesicht und Gegenstände.</p>
     <ul>
-      <li><b>Kneifen</b> mit Daumen und Zeigefinger zerquetscht Bugs.</li>
+      <li><b>Kneifen</b>: Hand ins Bild halten und Daumen- und Zeigefingerspitze zusammentippen. Der gepunktete Kreis zeigt, wie weit dein Griff reicht.</li>
       <li><b>Mund auf</b> frisst Dokumente: +42 Punkte.</li>
       <li>Kein Bug darf deinen <b>Helm</b> erreichen. Du hast drei Herzen.</li>
       <li><b>Tasse</b> zeigen bremst die Bugs. <b>Buch</b> zeigen gibt ein Herz zurück.</li>
@@ -83,16 +89,25 @@
 </div>
 
 <div id="tools" hidden>
+  <button id="info" type="button" class="quiet">Info</button>
   <button id="mode" type="button" class="quiet">Scanner</button>
   <button id="palette" type="button" class="quiet">Palette</button>
   <button id="sound" type="button" class="quiet">Ton aus</button>
+</div>
+
+<div id="infobox" hidden>
+  <pre id="infotext"></pre>
+  <div class="row">
+    <button id="infocopy" type="button">Kopieren</button>
+    <button id="infoclose" type="button" class="quiet">Schließen</button>
+  </div>
 </div>
 
 <script type="module">
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
-const VERSION = "1.1.0";                                   // shown on the start card, raise by hand on every change
+const VERSION = "1.2.0";                                   // shown on the start card, raise by hand on every change
 document.querySelector("#version").textContent = "Version " + VERSION;
 const query = new URLSearchParams(location.search);
 // Self-hosting: pass ?mp=<folder with vision_bundle.mjs and wasm/> and ?models=<folder with the three model files>.
@@ -287,6 +302,9 @@ function ditherToPalette() {
 // ---------------------------------------------------------------------------------------------
 const input = { face: null, faceSeen: 0, hands: [], objects: [] };
 const pinchMemory = [];
+// A pinch closes below either "close" value and opens again above both "open" values. reach: catch radius in game pixels,
+// hotMs: how long a fresh pinch keeps catching.
+const PINCH = { closeMetres: 0.035, openMetres: 0.055, closeRatio: 0.32, openRatio: 0.5, reach: 22, hotMs: 500 };
 const DETECTOR_NAMES = { hand: "Handerkennung", face: "Gesichtserkennung", object: "Bilderkennung" };
 let detectors = null;                                       // name -> { task, delegate, ms, calls, lastTs }
 
@@ -310,9 +328,29 @@ store.set("bug-hunt-cam-off", [...settings.off].join(",") || null);
 
 const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
 
+const makers = {};                                         // name -> (delegate) => Promise<task>
+const rememberCpu = name => { settings.cpu.add(name); store.set("bug-hunt-cam-cpu", [...settings.cpu].join(",")); };
+
+// Rebuild a detector on the CPU. Until the new task is ready the detector is paused.
+async function moveToCpu(name) {
+  const old = detectors[name];
+  if (!old || old.paused) return;
+  old.paused = true; rememberCpu(name);
+  logProblem(`${name}: GPU run failed, rebuilding on CPU`);
+  try {
+    try { old.task.close(); } catch { /* already broken */ }
+    const task = await makers[name]("CPU");
+    detectors[name] = { task, delegate: "CPU", ms: 0, calls: 0, lastTs: old.lastTs, fails: 0 };
+  } catch (err) {
+    delete detectors[name];
+    logProblem(`${name}/CPU: ${(err && err.message) || err}`);
+    noteError(`${DETECTOR_NAMES[name]} abgeschaltet. Details unter Info.`);
+  }
+}
+
 function runDetector(name, now) {
   const d = detectors && detectors[name];
-  if (!d) return null;
+  if (!d || d.paused) return null;
   const early = d.calls < 20;
   if (early) store.set("bug-hunt-cam-busy", name);
   const started = performance.now();
@@ -320,8 +358,10 @@ function runDetector(name, now) {
   let result = null;
   try { result = d.task.detectForVideo(video, d.lastTs); d.fails = 0; }
   catch (err) {
-    noteError(err);
-    if (++d.fails >= 5) { delete detectors[name]; noteError(`${DETECTOR_NAMES[name]} abgeschaltet: ${(err && err.message) || err}`); }
+    d.fails++;
+    logProblem(`${name}/${d.delegate}: ${(err && err.message) || err}`);
+    if (d.delegate === "GPU" && d.fails >= 2 && game.mode !== "idle") moveToCpu(name);
+    else if (d.fails >= 5) { delete detectors[name]; noteError(`${DETECTOR_NAMES[name]} abgeschaltet. Details unter Info.`); }
   }
   const took = performance.now() - started;
   d.ms = d.calls ? d.ms * 0.8 + took * 0.2 : took; d.calls++;
@@ -339,32 +379,41 @@ async function loadDetectors(report) {
   for (const [name, Task, options] of plan) {
     if (settings.off.has(name)) continue;
     report(`Lade ${DETECTOR_NAMES[name]} …`);
-    const make = delegate => Task.createFromOptions(files, { baseOptions: { modelAssetPath: MODELS[name], delegate }, runningMode: "VIDEO", ...options });
-    let delegate = settings.cpu.has(name) ? "CPU" : "GPU", task;
-    try {
-      try { task = await make(delegate); }
-      catch (err) { if (delegate === "CPU") throw err; console.warn("GPU delegate failed, using CPU", err); delegate = "CPU"; task = await make("CPU"); }
-    } catch (err) {
-      if (name !== "object") throw err;                     // the game works without object recognition
-      console.error(err); continue;
+    makers[name] = delegate => Task.createFromOptions(files, { baseOptions: { modelAssetPath: MODELS[name], delegate }, runningMode: "VIDEO", ...options });
+    let ready = false;
+    for (const delegate of settings.cpu.has(name) ? ["CPU"] : ["GPU", "CPU"]) {
+      try {
+        const task = await makers[name](delegate);
+        detectors[name] = { task, delegate, ms: 0, calls: 0, lastTs: 0, fails: 0 };
+        report(`Teste ${DETECTOR_NAMES[name]} …`);          // the first run compiles shaders: do it here, not in the game
+        await nextFrame();
+        runDetector(name, performance.now());
+        await nextFrame();
+        if (detectors[name].fails === 0) { ready = true; break; }
+        try { task.close(); } catch { /* already broken */ }
+      } catch (err) { logProblem(`${name}/${delegate} load: ${(err && err.message) || err}`); }
+      delete detectors[name];
+      if (delegate === "GPU") { rememberCpu(name); report(`${DETECTOR_NAMES[name]} läuft ohne Grafikchip …`); }
     }
-    detectors[name] = { task, delegate, ms: 0, calls: 0, lastTs: 0, fails: 0 };
-    report(`Teste ${DETECTOR_NAMES[name]} …`);              // the first run compiles shaders: do it here, not in the game
-    await nextFrame();
-    runDetector(name, performance.now());
-    await nextFrame();
+    if (!ready && name === "hand") throw new Error("Die Handerkennung läuft auf diesem Gerät nicht.");
   }
 }
 
 function readHands(result, now) {
   const hands = (result.landmarks || []).map((lm, i) => {
     const pts = lm.map(mapPoint);
-    const gap = dist(pts[4], pts[8]) / (dist(pts[0], pts[9]) || 1);          // thumb tip to index tip, relative to palm
+    // thumb tip to index tip: on screen relative to the palm, and in metres from the 3D hand model
+    const palm = Math.max(dist(pts[0], pts[9]), dist(pts[5], pts[17]) * 1.2) || 1;
+    const gap2d = dist(pts[4], pts[8]) / palm;
+    const w = result.worldLandmarks && result.worldLandmarks[i];
+    const gap3d = w ? Math.hypot(w[4].x - w[8].x, w[4].y - w[8].y, w[4].z - w[8].z) : Infinity;
+    const closed = gap3d < PINCH.closeMetres || gap2d < PINCH.closeRatio;
+    const open = gap2d > PINCH.openRatio && (gap3d === Infinity || gap3d > PINCH.openMetres);
     const was = pinchMemory[i] || { down: false, since: 0 };
-    const down = was.down ? gap < 0.55 : gap < 0.35;                          // hysteresis against flicker
+    const down = was.down ? !open : closed;                                   // hysteresis against flicker
     pinchMemory[i] = { down, since: down && !was.down ? now : was.since };
     return { pts, thumb: pts[4], index: pts[8], x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2,
-             pinch: down, pinchSince: pinchMemory[i].since };
+             pinch: down, pinchSince: pinchMemory[i].since, gap2d, gap3d };
   });
   pinchMemory.length = hands.length;
   return hands;
@@ -527,7 +576,7 @@ function update(dt, now) {
     const a = Math.atan2(dy, dx) + Math.sin(bug.wobble) * 0.6;
     bug.x += Math.cos(a) * bug.speed * slow * dt; bug.y += Math.sin(a) * bug.speed * slow * dt; bug.dy = dy;
     for (const hand of input.hands) {
-      if (hand.pinch && now - hand.pinchSince < 350 && Math.hypot(hand.x - bug.x, hand.y - bug.y) < 13) {
+      if (hand.pinch && now - hand.pinchSince < PINCH.hotMs && Math.hypot(hand.x - bug.x, hand.y - bug.y) < PINCH.reach) {
         bug.dead = true; game.score += 10; pop("+10", bug.x, bug.y - 8);
         burst(bug.x, bug.y, [INK.Y, INK.O, INK.W, INK.R]); SFX.squash();
       }
@@ -582,7 +631,12 @@ function drawHand(hand) {
     ctx.fillStyle = INK.k; ctx.fillRect(Math.round(tip.x) - 2, Math.round(tip.y) - 2, 5, 5);
     ctx.fillStyle = hand.pinch ? INK.Y : INK.C; ctx.fillRect(Math.round(tip.x) - 1, Math.round(tip.y) - 1, 3, 3);
   }
-  if (hand.pinch) { ring(hand.x, hand.y, 6, INK.Y); ring(hand.x, hand.y, 7, INK.k); }
+  const hot = hand.pinch && performance.now() - hand.pinchSince < PINCH.hotMs;
+  if (hot) { ring(hand.x, hand.y, PINCH.reach, INK.Y); ring(hand.x, hand.y, PINCH.reach + 1, INK.k); }
+  else if (!hand.pinch) {
+    ctx.fillStyle = INK.C;
+    for (let a = 0; a < 6.283; a += 0.2) ctx.fillRect(Math.round(hand.x + Math.cos(a) * PINCH.reach), Math.round(hand.y + Math.sin(a) * PINCH.reach), 1, 1);
+  }
 }
 function drawObject(o) {
   const x0 = Math.round(o.x), y0 = Math.round(o.y), x1 = Math.round(o.x + o.w), y1 = Math.round(o.y + o.h), n = 5;
@@ -594,7 +648,9 @@ function drawObject(o) {
   const label = `${LABELS_DE[o.name] || o.name} ${Math.round(o.score * 100)}`;
   drawText(label, Math.max(2, Math.min(LW - textWidth(label) - 2, x0)), Math.max(26, y0 - 10), color);
 }
-const bottomLine = () => LH - Math.ceil(64 / pixel) - 8;   // lowest text row that the buttons do not cover
+let toolsHeight = 54;                                       // measured, because the buttons wrap on narrow screens
+setInterval(() => { const box = $("#tools"); toolsHeight = box.hidden ? 0 : box.getBoundingClientRect().height; }, 1000);
+const bottomLine = () => LH - Math.ceil((toolsHeight + 10) / pixel) - 8;   // lowest text row that the buttons do not cover
 // e.g. "H12 F18 OC140 28FPS": milliseconds per run for hand, face, object; C = on the CPU, - = switched off
 function drawReadout() {
   if (!detectors) return;
@@ -605,9 +661,31 @@ function drawReadout() {
   drawText(`${parts.join(" ")} ${Math.round(fps)}FPS`, 3, bottomLine(), INK.A);
 }
 let lastError = null;
+const problems = [];                                        // full texts for the info panel, repeated lines are counted
+function logProblem(text) {
+  console.warn(text);
+  const last = problems[problems.length - 1];
+  if (last && last.text === text) last.count++; else problems.push({ text, count: 1 });
+  if (problems.length > 12) problems.shift();
+}
 function noteError(err) {
-  console.error(err);
-  lastError = { text: String((err && err.message) || err), until: performance.now() + 8000 };
+  const text = String((err && err.message) || err);
+  logProblem(text);
+  lastError = { text, until: performance.now() + 8000 };
+}
+function infoText() {
+  const lines = [`Bug Hunt Cam ${VERSION}`, navigator.userAgent,
+    `Canvas ${LW}x${LH} @${pixel}, Video ${video.videoWidth}x${video.videoHeight}, ${Math.round(fps)} fps, Modus ${game.mode}`];
+  for (const name of Object.keys(DETECTOR_NAMES)) {
+    const d = detectors && detectors[name];
+    lines.push(d ? `${name}: ${d.delegate}, ${d.ms.toFixed(1)} ms, ${d.calls} Läufe, ${d.fails} Fehler in Folge` : `${name}: aus`);
+  }
+  lines.push(input.hands.length ? "" : "Keine Hand im Bild.");
+  input.hands.forEach((h, i) => lines.push(`Hand ${i + 1}: Abstand ${Number.isFinite(h.gap3d) ? (h.gap3d * 100).toFixed(1) + " cm" : "?"}, ` +
+    `Verhältnis ${h.gap2d === undefined ? "?" : h.gap2d.toFixed(2)}, Kneifen ${h.pinch ? "ja" : "nein"}`));
+  lines.push(`Gemerkt: CPU [${[...settings.cpu]}], aus [${[...settings.off]}]`, "", problems.length ? "Meldungen:" : "Keine Meldungen.");
+  for (const p of problems) lines.push(`${p.count}x ${p.text}`, "");
+  return lines.join("\n");
 }
 function drawError(now) {
   if (!lastError || now > lastError.until) return;
@@ -676,7 +754,7 @@ function tick(now) {
   try { drawError(now); } catch { /* nothing left to try */ }
 }
 requestAnimationFrame(tick);
-window.bugHunt = { game, input, settings, get detectors() { return detectors; } };                          // handy in the console
+window.bugHunt = { game, input, settings, problems, get detectors() { return detectors; } };                          // handy in the console
 
 // ---------------------------------------------------------------------------------------------
 // Start-up and controls
@@ -695,7 +773,7 @@ function cameraErrorText(err) {
 }
 function enterGame(demo) {
   game.demo = demo; resetGame();
-  $("#panel").hidden = true; $("#tools").hidden = false; $("#mode").hidden = demo;
+  $("#panel").hidden = true; $("#tools").hidden = false; $("#mode").hidden = demo; $("#info").hidden = demo;
 }
 let facing = "user";
 async function openCamera(wanted) {
@@ -735,8 +813,9 @@ async function startCamera() {
   try {
     await loadDetectors(report);
   } catch (err) {
-    console.error(err);
-    report("Die Erkennung ließ sich nicht laden. Prüfe die Internetverbindung und starte neu.", true);
+    logProblem(`start: ${(err && err.message) || err}`);
+    report(/läuft auf diesem Gerät nicht/.test(String(err && err.message)) ? err.message
+           : "Die Erkennung ließ sich nicht laden. Prüfe die Internetverbindung und starte neu.", true);
     $("#start").disabled = false; return;
   }
   report("");
@@ -748,6 +827,12 @@ $("#demo").addEventListener("click", () => {
   enterGame(true);
 });
 $("#mode").addEventListener("click", switchMode);
+$("#info").addEventListener("click", () => { $("#infotext").textContent = infoText(); $("#infobox").hidden = false; });
+$("#infoclose").addEventListener("click", () => { $("#infobox").hidden = true; });
+$("#infocopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("#infotext").textContent); $("#infocopy").textContent = "Kopiert"; }
+  catch { $("#infocopy").textContent = "Bitte Text markieren"; }
+});
 $("#palette").addEventListener("click", () => { paletteIndex = (paletteIndex + 1) % PALETTES.length; });
 $("#sound").addEventListener("click", () => { muted = !muted; $("#sound").textContent = muted ? "Ton an" : "Ton aus"; });
 screen.addEventListener("click", () => {
