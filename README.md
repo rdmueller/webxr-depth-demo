@@ -4,6 +4,18 @@ Tiefe aus der Handykamera, direkt im Browser: Abstand messen, Tiefenbild ansehen
 
 **Demo:** https://rdmueller.github.io/webxr-depth-demo/
 
+## Bug Hunt Cam
+
+Ein zweites Experiment im Unterordner `bug-hunt-cam/`: ein Webcam-Spiel im Pixel-Art-Stil. Die Seite erkennt Hände, Gesicht und Gegenstände mit MediaPipe direkt im Browser.
+
+**Demo:** https://rdmueller.github.io/webxr-depth-demo/bug-hunt-cam/
+
+- Kneifen mit Daumen und Zeigefinger zerquetscht Bugs, Mund auf frisst Dokumente.
+- Eine Tasse vor der Kamera bremst die Bugs, ein Buch gibt ein Herz zurück.
+- „Scanner" schaltet auf die Rückkamera und startet eine Schnitzeljagd nach Gegenständen.
+
+Eine einzelne `index.html`. Bibliothek und Modelle lädt sie beim Start von jsDelivr und Google Storage, das Kamerabild bleibt im Browser. Die folgenden Abschnitte beschreiben die WebXR-Demo.
+
 ## Voraussetzungen
 
 - Chrome für Android auf einem ARCore-fähigen Handy (z. B. Galaxy S25)
