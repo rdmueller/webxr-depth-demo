@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bug Hunt Cam</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  /* One dusk-arcade world, single theme by choice. Layout: full-bleed pixel canvas, one start card on top. */
+  :root {
+    --night: #110a30;
+    --dusk: #391b70;
+    --rose: #de506c;
+    --gold: #ffe066;
+    --cyan: #46f0e4;
+    --ink: #fbf6ff;
+    --font-display: "Press Start 2P", ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; background: var(--night); color: var(--ink); overflow: hidden;
+               font-family: var(--font-display); touch-action: manipulation; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; }
+  #screen { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+  #cam { position: fixed; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+  /* scanlines and vignette, sized to the game pixel */
+  #crt { position: fixed; inset: 0; pointer-events: none;
+         background:
+           radial-gradient(ellipse at 50% 50%, transparent 55%, rgba(8, 4, 26, .55) 100%),
+           linear-gradient(to bottom, transparent 0 68%, rgba(8, 4, 26, .28) 68% 100%);
+         background-size: 100% 100%, 100% var(--px, 6px); }
+  #panel { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; box-sizing: border-box;
+           background: rgba(17, 10, 48, .82); overflow: auto; }
+  #panel[hidden] { display: none; }
+  .card { width: min(100%, 560px); box-sizing: border-box; padding: 24px 20px; background: var(--night);
+          border: 4px solid var(--ink); box-shadow: 8px 8px 0 var(--dusk); display: flex; flex-direction: column; gap: 18px; }
+  h1 { margin: 0; font-size: clamp(18px, 5.2vw, 26px); line-height: 1.3; color: var(--gold);
+       text-shadow: 3px 3px 0 var(--rose); text-wrap: balance; }
+  p, li, button { font-size: 11px; line-height: 1.9; }
+  p { margin: 0; }
+  ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+  li { padding-left: 22px; position: relative; }
+  li::before { content: ""; position: absolute; left: 2px; top: 6px; width: 8px; height: 8px; background: var(--cyan); }
+  li b { color: var(--gold); font-weight: normal; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; }
+  button { font-family: inherit; color: var(--night); background: var(--gold); border: 0; padding: 12px 16px; min-height: 44px;
+           cursor: pointer; box-shadow: 4px 4px 0 var(--rose); }
+  button.quiet { background: var(--dusk); color: var(--ink); box-shadow: 4px 4px 0 #1d1150; }
+  button:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--rose); }
+  button:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
+  #status { color: var(--cyan); min-height: 2em; }
+  #status.error { color: #ff8fa3; }
+  .note { color: #b9a6dc; font-size: 9px; }
+  #tools { position: fixed; right: 10px; bottom: 10px; display: flex; gap: 10px; }
+  #tools[hidden] { display: none; }
+  #tools button { font-size: 9px; padding: 10px 12px; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="screen" width="150" height="150"></canvas></div>
+<div id="crt"></div>
+<video id="cam" playsinline muted></video>
+
+<div id="panel">
+  <div class="card">
+    <h1>BUG HUNT CAM</h1>
+    <p>Die Webcam macht dich zur Pixel-Figur. Die Seite erkennt deine Hände, dein Gesicht und Gegenstände.</p>
+    <ul>
+      <li><b>Kneifen</b> mit Daumen und Zeigefinger zerquetscht Bugs.</li>
+      <li><b>Mund auf</b> frisst Dokumente: +42 Punkte.</li>
+      <li>Kein Bug darf deinen <b>Helm</b> erreichen. Du hast drei Herzen.</li>
+      <li><b>Tasse</b> zeigen bremst die Bugs. <b>Buch</b> zeigen gibt ein Herz zurück.</li>
+      <li><b>Scanner</b> schaltet auf die Rückkamera: Finde den Gegenstand, der oben steht.</li>
+    </ul>
+    <div class="row">
+      <button id="start" type="button">Kamera starten</button>
+      <button id="demo" type="button" class="quiet">Demo ohne Kamera</button>
+    </div>
+    <p id="status" role="status"></p>
+    <p class="note">Dein Kamerabild bleibt im Browser. Aus dem Netz kommen nur die Erkennungsmodelle, einmalig rund 30 MB. <span id="version"></span></p>
+  </div>
+</div>
+
+<div id="tools" hidden>
+  <button id="mode" type="button" class="quiet">Scanner</button>
+  <button id="palette" type="button" class="quiet">Palette</button>
+  <button id="sound" type="button" class="quiet">Ton aus</button>
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------------------------
+const VERSION = "1.0.0";                                   // shown on the start card, raise by hand on every change
+document.querySelector("#version").textContent = "Version " + VERSION;
+const query = new URLSearchParams(location.search);
+// Self-hosting: pass ?mp=<folder with vision_bundle.mjs and wasm/> and ?models=<folder with the three model files>.
+const MP_BASE = query.get("mp") || "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2";
+const MODEL_BASE = query.get("models");
+const MODELS = {
+  hand: MODEL_BASE ? `${MODEL_BASE}/hand_landmarker.task`
+    : "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+  face: MODEL_BASE ? `${MODEL_BASE}/face_landmarker.task`
+    : "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+  object: MODEL_BASE ? `${MODEL_BASE}/efficientdet_lite0.tflite`
+    : "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+};
+
+const INK = { k: "#120824", W: "#fbf6ff", L: "#d2c8e6", A: "#9486b4", a: "#5b4a80", b: "#33235a", C: "#46f0e4", T: "#1ba3b0",
+              Y: "#ffe066", y: "#e8a52e", O: "#ff8b2b", R: "#f4405a", r: "#8e1f4a", M: "#ff5fb0", N: "#a02070",
+              G: "#58e6a0", g: "#1f9a78" };
+
+// luminance ramps, dark to light: the camera image is reduced to one of these
+const PALETTES = [
+  { name: "DUSK",   ramp: ["#110a30", "#391b70", "#8a2d8a", "#de506c", "#f6a25e", "#ffe9b0"] },
+  { name: "ARCADE", ramp: ["#07051a", "#1d1546", "#126080", "#1ba3b0", "#46f0e4", "#f6f2ff"] },
+  { name: "MOOS",   ramp: ["#0f2a1f", "#2f6a3f", "#7fb04a", "#d6e894"] },
+  { name: "MONO",   ramp: ["#0b0b10", "#3a3a48", "#8a8aa0", "#e8e8f4"] },
+].map(p => ({ ...p, rgb: p.ramp.map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))) }));
+
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => v / 16);
+const FONT = {"A":".###.#...##...#######...##...##...#","B":"####.#...##...#####.#...##...#####.","C":".###.#...##....#....#....#...#.###.","D":"####.#...##...##...##...##...#####.","E":"######....#....####.#....#....#####","F":"######....#....####.#....#....#....","G":".###.#...##....#.####...##...#.###.","H":"#...##...##...#######...##...##...#","I":".###...#....#....#....#....#...###.","J":"..###...#....#....#....#.#..#..##..","K":"#...##..#.#.#..##...#.#..#..#.#...#","L":"#....#....#....#....#....#....#####","M":"#...###.###.#.##.#.##...##...##...#","N":"#...###..##.#.##..###...##...##...#","O":".###.#...##...##...##...##...#.###.","P":"####.#...##...#####.#....#....#....","Q":".###.#...##...##...##.#.##..#..##.#","R":"####.#...##...#####.#.#..#..#.#...#","S":".#####....#.....###.....#....#####.","T":"#####..#....#....#....#....#....#..","U":"#...##...##...##...##...##...#.###.","V":"#...##...##...##...##...#.#.#...#..","W":"#...##...##...##.#.##.#.###.###...#","X":"#...##...#.#.#...#...#.#.#...##...#","Y":"#...##...#.#.#...#....#....#....#..","Z":"#####....#...#...#...#...#....#####","0":".###.#...##..###.#.###..##...#.###.","1":"..#...##....#....#....#....#...###.","2":".###.#...#....#...#...#...#...#####","3":"####.....#....#.###.....#....#####.","4":"...#...##..#.#.#..#.#####...#....#.","5":"######....####.....#....##...#.###.","6":".###.#....#....####.#...##...#.###.","7":"#####....#...#...#....#....#....#..","8":".###.#...##...#.###.#...##...#.###.","9":".###.#...##...#.####....#....#.###.","-":"...............#####...............","+":".......#....#..#####..#....#......."," ":"...................................","!":"..#....#....#....#....#.........#..",":":".......#...................#.......","=":"..........#####.....#####..........",".":"................................#..","%":"##..###.#....#...#...#....#.###..##"};
+const LABELS_DE = { "cup": "TASSE", "book": "BUCH", "cell phone": "HANDY", "bottle": "FLASCHE", "keyboard": "TASTATUR",
+  "mouse": "MAUS", "laptop": "LAPTOP", "banana": "BANANE", "apple": "APFEL", "orange": "ORANGE", "scissors": "SCHERE",
+  "clock": "UHR", "chair": "STUHL", "cat": "KATZE", "dog": "HUND", "teddy bear": "TEDDY", "tv": "MONITOR",
+  "potted plant": "PFLANZE", "spoon": "LOEFFEL", "fork": "GABEL", "knife": "MESSER", "bowl": "SCHALE", "wine glass": "GLAS",
+  "backpack": "RUCKSACK", "umbrella": "SCHIRM", "tie": "KRAWATTE", "sports ball": "BALL", "remote": "FERNBEDIENUNG",
+  "toothbrush": "ZAHNBUERSTE", "vase": "VASE", "couch": "SOFA", "bed": "BETT", "handbag": "TASCHE" };
+const HAND_BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],
+                    [15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+// ---------------------------------------------------------------------------------------------
+// Pixel canvas, sprites, text
+// ---------------------------------------------------------------------------------------------
+const $ = sel => document.querySelector(sel);
+const screen = $("#screen"), ctx = screen.getContext("2d", { willReadFrequently: true });
+const video = $("#cam");
+let LW = 150, LH = 150, pixel = 4;
+
+function resize() {
+  pixel = Math.max(2, Math.round(Math.min(innerWidth, innerHeight) / 150));
+  LW = Math.ceil(innerWidth / pixel); LH = Math.ceil(innerHeight / pixel);
+  screen.width = LW; screen.height = LH;
+  screen.style.width = LW * pixel + "px"; screen.style.height = LH * pixel + "px";
+  $("#crt").style.setProperty("--px", pixel + "px");
+}
+addEventListener("resize", resize); resize();
+
+function makeSprite(rows, map = {}, flipY = false) {
+  const src = flipY ? [...rows].reverse() : rows;
+  const c = document.createElement("canvas");
+  c.width = src[0].length + 2; c.height = src.length + 2;
+  const g = c.getContext("2d");
+  const cells = [];
+  src.forEach((row, j) => [...row].forEach((ch, i) => { if (ch !== ".") cells.push([i + 1, j + 1, INK[map[ch] || ch]]); }));
+  g.fillStyle = INK.k;                                       // dark outline keeps sprites readable on any image
+  for (const [i, j] of cells) { g.fillRect(i - 1, j, 3, 1); g.fillRect(i, j - 1, 1, 3); }
+  for (const [i, j, col] of cells) { g.fillStyle = col; g.fillRect(i, j, 1, 1); }
+  return c;
+}
+const drawSprite = (s, x, y) => ctx.drawImage(s, Math.round(x - s.width / 2), Math.round(y - s.height / 2));
+
+const BUG_ROWS = [[
+  "...A.....A...", "....A...A....", ".....HHH.....", "....HEHEH....", "L..BBBdBBB..L", ".LBBBBdBBBBL.",
+  "..BBSBdBSBB..", "LLBBBBdBBBBLL", "..BBSBdBSBB..", ".LBBBBdBBBBL.", "L..BBBdBBB..L", "....BBdBB....",
+], [
+  "....A...A....", "....A...A....", ".....HHH.....", "....HEHEH....", ".L.BBBdBBB.L.", "L.BBBBdBBBB.L",
+  "..BBSBdBSBB..", ".LBBBBdBBBBL.", "L.BBSBdBSBB.L", "..BBBBdBBBB..", ".L.BBBdBBB.L.", "....BBdBB....",
+]];
+const BUG_INKS = [
+  { B: "R", d: "r", S: "k", H: "b", E: "W", L: "L", A: "L" },
+  { B: "G", d: "g", S: "Y", H: "b", E: "W", L: "L", A: "L" },
+  { B: "M", d: "N", S: "W", H: "b", E: "Y", L: "L", A: "L" },
+  { B: "O", d: "r", S: "Y", H: "b", E: "W", L: "L", A: "L" },
+];
+// BUGS[variant][frame][0 = head up, 1 = head down]
+const BUGS = BUG_INKS.map(ink => BUG_ROWS.map(rows => [makeSprite(rows, ink), makeSprite(rows, ink, true)]));
+const DOC = makeSprite(["WWWWA..", "WWWWAA.", "WWWWWWW", "WaaaaaW", "WWWWWWW", "WaaaaaW", "WWWWWWW", "WaaaWWW", "WWWWWWW"]);
+const HEART = makeSprite([".RR.RR.", "RWRRRRR", "RRRRRRR", ".RRRRR.", "..RRR..", "...R..."]);
+const HEART_LOST = makeSprite([".RR.RR.", "RRRRRRR", "RRRRRRR", ".RRRRR.", "..RRR..", "...R..."], { R: "r" });
+const CUP = makeSprite([".C...C.", "..C.C..", "WWWWWW.", "WvvvvWW", "WWWWWWW", "WWWWWW.", ".WWWW.."], { v: "y" });
+
+function textWidth(s) { return s.length * 6 - 1; }
+function drawText(s, x, y, color = INK.W, align = "left", shadow = INK.k) {
+  s = String(s).toUpperCase();
+  if (align === "right") x -= textWidth(s); else if (align === "center") x -= textWidth(s) >> 1;
+  x = Math.round(x); y = Math.round(y);
+  for (const [ox, oy, col] of [[1, 1, shadow], [0, 0, color]]) {
+    if (!col) continue;
+    ctx.fillStyle = col;
+    for (let n = 0; n < s.length; n++) {
+      const g = FONT[s[n]]; if (!g) continue;
+      for (let k = 0; k < 35; k++) if (g[k] === "#") ctx.fillRect(x + n * 6 + (k % 5) + ox, y + ((k / 5) | 0) + oy, 1, 1);
+    }
+  }
+}
+function dot(x, y, color) { ctx.fillStyle = color; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function line(x0, y0, x1, y1, color) {                       // Bresenham
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy; ctx.fillStyle = color;
+  for (let n = 0; n < 2000; n++) {
+    ctx.fillRect(x0, y0, 1, 1);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function ring(cx, cy, r, color, from = 0, to = Math.PI * 2) {
+  ctx.fillStyle = color;
+  const step = 0.6 / Math.max(r, 1);
+  for (let a = from; a < to; a += step) ctx.fillRect(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), 1, 1);
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// ---------------------------------------------------------------------------------------------
+// Sound: tiny square-wave blips
+// ---------------------------------------------------------------------------------------------
+let audio = null, muted = false;
+function beep(freq, dur = 0.08, slideTo = 0, type = "square", vol = 0.05, delay = 0) {
+  if (!audio || muted) return;
+  try {
+    const t = audio.currentTime + delay, o = audio.createOscillator(), g = audio.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(audio.destination); o.start(t); o.stop(t + dur + 0.02);
+  } catch { /* sound is optional */ }
+}
+const SFX = {
+  squash: () => beep(700, 0.09, 180),
+  eat: () => { beep(880, 0.07); beep(1320, 0.1, 0, "square", 0.05, 0.07); },
+  hit: () => beep(160, 0.35, 50, "sawtooth", 0.08),
+  boost: () => [523, 659, 784, 1047].forEach((f, i) => beep(f, 0.09, 0, "square", 0.05, i * 0.07)),
+  over: () => [392, 330, 262, 196].forEach((f, i) => beep(f, 0.22, 0, "triangle", 0.09, i * 0.2)),
+};
+
+// ---------------------------------------------------------------------------------------------
+// Camera image -> dithered pixel art
+// ---------------------------------------------------------------------------------------------
+let paletteIndex = 0;
+let crop = { x: 0, y: 0, w: 1, h: 1 };                      // part of the video frame that covers the canvas
+let mirror = true;                                          // selfie camera is mirrored, rear camera is not
+
+function updateCrop() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.min(vw / LW, vh / LH);
+  crop = { w: LW * s, h: LH * s, x: (vw - LW * s) / 2, y: (vh - LH * s) / 2 };
+}
+function drawCameraFrame() {
+  updateCrop();
+  ctx.save(); ctx.imageSmoothingEnabled = true;
+  if (mirror) { ctx.translate(LW, 0); ctx.scale(-1, 1); }    // mirror: moving right moves right
+  ctx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, LW, LH);
+  ctx.restore();
+}
+function drawDemoBackdrop(t) {
+  const img = ctx.createImageData(LW, LH), d = img.data;
+  for (let y = 0, i = 0; y < LH; y++) for (let x = 0; x < LW; x++, i += 4) {
+    const v = 110 + 55 * Math.sin(x * 0.045 + t * 0.6) + 45 * Math.sin(y * 0.035 - t * 0.4) + 35 * Math.sin((x + y) * 0.03 + t * 0.9);
+    d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function ditherToPalette() {
+  const img = ctx.getImageData(0, 0, LW, LH), d = img.data;
+  const rgb = PALETTES[paletteIndex].rgb, top = rgb.length - 1;
+  for (let y = 0, i = 0; y < LH; y++) {
+    const row = (y & 3) * 4;
+    for (let x = 0; x < LW; x++, i += 4) {
+      let l = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) / 65280;          // 0..1
+      l = (l - 0.5) * 1.2 + 0.5;                                              // a little more contrast
+      let k = Math.floor(l * top + BAYER[row + (x & 3)]);
+      k = k < 0 ? 0 : k > top ? top : k;
+      const c = rgb[k]; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2];
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recognition: MediaPipe results -> game input in canvas coordinates
+// ---------------------------------------------------------------------------------------------
+const input = { face: null, faceSeen: 0, hands: [], objects: [] };
+const pinchMemory = [];
+let detectors = null, lastVideoTime = -1, frameCount = 0, lastObjectScan = 0;
+
+const mapPixel = (px, py) => ({ x: ((mirror ? video.videoWidth - px : px) - crop.x) / crop.w * LW, y: (py - crop.y) / crop.h * LH });
+const mapPoint = p => mapPixel(p.x * video.videoWidth, p.y * video.videoHeight);
+
+async function loadDetectors(report) {
+  report("Lade Erkennung …");
+  const mp = await import(`${MP_BASE}/vision_bundle.mjs`);
+  const files = await mp.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
+  const create = async (Task, model, options) => {
+    try {
+      return await Task.createFromOptions(files, { baseOptions: { modelAssetPath: model, delegate: "GPU" }, runningMode: "VIDEO", ...options });
+    } catch (gpuError) {
+      console.warn("GPU delegate failed, using CPU", gpuError);
+      return await Task.createFromOptions(files, { baseOptions: { modelAssetPath: model, delegate: "CPU" }, runningMode: "VIDEO", ...options });
+    }
+  };
+  report("Lade Handerkennung …");
+  const hand = await create(mp.HandLandmarker, MODELS.hand, { numHands: 2 });
+  report("Lade Gesichtserkennung …");
+  const face = await create(mp.FaceLandmarker, MODELS.face, { numFaces: 1 });
+  report("Lade Bilderkennung …");
+  const object = await create(mp.ObjectDetector, MODELS.object, { scoreThreshold: 0.45, maxResults: 5 });
+  return { hand, face, object };
+}
+
+function readHands(result, now) {
+  const hands = (result.landmarks || []).map((lm, i) => {
+    const pts = lm.map(mapPoint);
+    const gap = dist(pts[4], pts[8]) / (dist(pts[0], pts[9]) || 1);          // thumb tip to index tip, relative to palm
+    const was = pinchMemory[i] || { down: false, since: 0 };
+    const down = was.down ? gap < 0.55 : gap < 0.35;                          // hysteresis against flicker
+    pinchMemory[i] = { down, since: down && !was.down ? now : was.since };
+    return { pts, thumb: pts[4], index: pts[8], x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2,
+             pinch: down, pinchSince: pinchMemory[i].since };
+  });
+  pinchMemory.length = hands.length;
+  return hands;
+}
+function readFace(result, previous) {
+  const lm = result.faceLandmarks && result.faceLandmarks[0];
+  if (!lm) return null;
+  const top = mapPoint(lm[10]), chin = mapPoint(lm[152]), upper = mapPoint(lm[13]), lower = mapPoint(lm[14]);
+  const height = dist(top, chin) || 1;
+  const now = { x: (top.x + chin.x) / 2, y: (top.y + chin.y) / 2 - height * 0.06, r: height * 0.74,
+                mx: (upper.x + lower.x) / 2, my: (upper.y + lower.y) / 2, gape: dist(upper, lower) / height };
+  if (previous) for (const key of ["x", "y", "r", "mx", "my"]) now[key] = previous[key] + (now[key] - previous[key]) * 0.6;
+  now.open = previous && previous.open ? now.gape > 0.05 : now.gape > 0.08;
+  return now;
+}
+function readObjects(result) {
+  return (result.detections || []).map(det => {
+    const cat = det.categories[0], b = det.boundingBox;
+    const p1 = mapPixel(b.originX, b.originY), p2 = mapPixel(b.originX + b.width, b.originY + b.height);
+    return { name: cat.categoryName, score: cat.score, x: Math.min(p1.x, p2.x), y: p1.y, w: Math.abs(p2.x - p1.x), h: p2.y - p1.y };
+  }).filter(o => o.name !== "person");
+}
+function recognize(now) {
+  if (!detectors || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime; frameCount++;
+  try {
+    input.hands = readHands(detectors.hand.detectForVideo(video, now), now);
+    if (game.mode === "scan") input.face = null;
+    else if (frameCount % 2 === 0) {                                          // faces move slowly: every second frame is enough
+      const face = readFace(detectors.face.detectForVideo(video, now), input.face);
+      if (face) { input.face = face; input.faceSeen = now; }
+      else if (now - input.faceSeen > 700) input.face = null;
+    }
+    if (now - lastObjectScan > (game.mode === "scan" ? 200 : 450)) {
+      lastObjectScan = now;
+      input.objects = readObjects(detectors.object.detectForVideo(video, now));
+    }
+  } catch (err) { console.error("recognition failed", err); }
+}
+
+// Demo: a scripted player, so the page shows something without a camera.
+function demoInput(t, now) {
+  const fx = LW / 2 + Math.sin(t * 0.5) * LW * 0.12, fy = LH * 0.52 + Math.sin(t * 0.8) * 6, r = Math.min(LW, LH) * 0.17;
+  const doc = game.docs.find(d => Math.hypot(d.x - fx, d.y - (fy + r * 0.45)) < r);
+  input.face = { x: fx, y: fy, r, mx: fx, my: fy + r * 0.45, gape: doc ? 0.14 : 0.01, open: !!doc };
+  input.faceSeen = now;
+  const hand = demoInput.hand || (demoInput.hand = { x: LW * 0.25, y: LH * 0.3, pinch: false, pinchSince: 0 });
+  const target = game.bugs.filter(b => !b.dead).sort((a, b) => Math.hypot(a.x - fx, a.y - fy) - Math.hypot(b.x - fx, b.y - fy))[0];
+  hand.pinch = false;
+  if (target) {
+    const dx = target.x - hand.x, dy = target.y - hand.y, d = Math.hypot(dx, dy);
+    if (d > 3) { hand.x += dx / d * Math.min(d, 1.6); hand.y += dy / d * Math.min(d, 1.6); }
+    else { hand.pinch = true; hand.pinchSince = now; }
+  }
+  const spread = hand.pinch ? 1 : 5;
+  input.hands = [{ ...hand, pts: null, thumb: { x: hand.x - spread, y: hand.y + 2 }, index: { x: hand.x + spread, y: hand.y - 2 } }];
+  const phase = t % 30;
+  input.objects = phase > 12 && phase < 15 ? [{ name: "cup", score: 0.87, x: LW * 0.68, y: LH * 0.62, w: 26, h: 28 }] : [];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Game
+// ---------------------------------------------------------------------------------------------
+const game = { mode: "idle", demo: false, t: 0, score: 0, hi: 0, hearts: 3, docCount: 0, bugs: [], docs: [], bits: [], pops: [],
+               spawnIn: 1.5, docIn: 3, shake: 0, flash: 0, safe: 0, boost: 0, boostCooldown: 0, bookCooldown: 0, overAt: 0 };
+try { game.hi = Number(localStorage.getItem("bug-hunt-cam-hi")) || 0; } catch { /* storage is optional */ }
+
+const SCAN_TARGETS = ["cup", "book", "bottle", "keyboard", "mouse", "laptop", "chair", "clock", "potted plant", "tv", "scissors",
+                      "spoon", "fork", "bowl", "banana", "apple", "backpack", "remote", "vase", "couch"];
+function nextTarget() {
+  const others = SCAN_TARGETS.filter(name => name !== game.target);
+  game.target = others[(Math.random() * others.length) | 0];
+}
+function resetScanner() {
+  Object.assign(game, { mode: "scan", t: 0, score: 0, finds: 0, bugs: [], docs: [], bits: [], pops: [], shake: 0, flash: 0, boost: 0 });
+  nextTarget();
+}
+function updateScanner(dt) {
+  game.t += dt;
+  const hit = input.objects.find(o => o.name === game.target && o.score >= 0.5);
+  if (!hit) return;
+  game.score += 100; game.finds++;
+  pop("GEFUNDEN! +100", LW / 2, LH * 0.45, INK.Y);
+  burst(hit.x + hit.w / 2, hit.y + hit.h / 2, [INK.Y, INK.C, INK.W], 20); SFX.boost();
+  nextTarget();
+}
+function resetGame() {
+  Object.assign(game, { mode: "play", t: 0, score: 0, hearts: 3, docCount: 0, bugs: [], docs: [], bits: [], pops: [],
+                        spawnIn: 1.5, docIn: 3, shake: 0, flash: 0, safe: 0, boost: 0, boostCooldown: 0, bookCooldown: 0 });
+}
+function spawnBug() {
+  const side = (Math.random() * 4) | 0;
+  const pos = side === 0 ? { x: rand(0, LW), y: -8 } : side === 1 ? { x: LW + 8, y: rand(0, LH) }
+            : side === 2 ? { x: rand(0, LW), y: LH + 8 } : { x: -8, y: rand(0, LH) };
+  game.bugs.push({ ...pos, speed: rand(8, 12) + Math.min(16, game.t * 0.2), wobble: rand(0, 6.28), kind: (Math.random() * 4) | 0, dy: 1 });
+}
+function burst(x, y, colors, n = 12) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, 6.28), s = rand(15, 60);
+    game.bits.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.25, 0.6), color: colors[i % colors.length] });
+  }
+}
+const pop = (text, x, y, color = INK.Y) => game.pops.push({ text, x, y, life: 0.9, color });
+
+function update(dt, now) {
+  const face = input.face;
+  game.shake = Math.max(0, game.shake - dt); game.flash = Math.max(0, game.flash - dt);
+  for (const b of game.bits) { b.x += b.vx * dt; b.y += b.vy * dt; b.vy += 90 * dt; b.life -= dt; }
+  game.bits = game.bits.filter(b => b.life > 0);
+  for (const p of game.pops) { p.y -= 12 * dt; p.life -= dt; }
+  game.pops = game.pops.filter(p => p.life > 0);
+
+  if (game.mode === "over") {
+    const pinched = input.hands.some(h => h.pinch && now - h.pinchSince < 200);
+    if (pinched && now - game.overAt > 1200) resetGame();
+    return;
+  }
+  if (game.mode === "scan") { updateScanner(dt); return; }
+  if (game.mode !== "play") return;
+  game.t += dt;
+  game.safe = Math.max(0, game.safe - dt);
+  game.boost = Math.max(0, game.boost - dt);
+  game.boostCooldown = Math.max(0, game.boostCooldown - dt);
+  game.bookCooldown = Math.max(0, game.bookCooldown - dt);
+
+  // recognised objects act as power-ups
+  for (const o of input.objects) {
+    if (o.name === "cup" && game.boostCooldown === 0) {
+      game.boost = 6; game.boostCooldown = 20; pop("KAFFEE-BOOST!", LW / 2, LH * 0.4, INK.C); SFX.boost();
+    }
+    if (o.name === "book" && game.bookCooldown === 0 && game.hearts < 3) {
+      game.hearts++; game.bookCooldown = 30; pop("RTFM: +1 HERZ", LW / 2, LH * 0.4, INK.M); SFX.boost();
+    }
+  }
+
+  if (!face) return;                                          // no face, no fight: the game waits
+
+  game.spawnIn -= dt;
+  if (game.spawnIn <= 0) { spawnBug(); game.spawnIn = Math.max(0.7, 2.0 - game.t * 0.015) * rand(0.7, 1.3); }
+  game.docIn -= dt;
+  if (game.docIn <= 0) { game.docs.push({ x: rand(12, LW - 12), y: -8, speed: rand(12, 20), sway: rand(0, 6.28) }); game.docIn = rand(2.5, 5); }
+
+  const slow = game.boost > 0 ? 0.35 : 1;
+  for (const bug of game.bugs) {
+    const dx = face.x - bug.x, dy = face.y - bug.y, d = Math.hypot(dx, dy) || 1;
+    bug.wobble += dt * 3;
+    const a = Math.atan2(dy, dx) + Math.sin(bug.wobble) * 0.6;
+    bug.x += Math.cos(a) * bug.speed * slow * dt; bug.y += Math.sin(a) * bug.speed * slow * dt; bug.dy = dy;
+    for (const hand of input.hands) {
+      if (hand.pinch && now - hand.pinchSince < 350 && Math.hypot(hand.x - bug.x, hand.y - bug.y) < 13) {
+        bug.dead = true; game.score += 10; pop("+10", bug.x, bug.y - 8);
+        burst(bug.x, bug.y, [INK.Y, INK.O, INK.W, INK.R]); SFX.squash();
+      }
+    }
+    if (!bug.dead && d < face.r + 3) {
+      bug.dead = true; burst(bug.x, bug.y, [INK.R, INK.W, INK.M], 16);
+      if (game.safe === 0) { game.hearts--; game.safe = 1.2; game.shake = 0.35; game.flash = 0.25; SFX.hit(); }
+    }
+  }
+  game.bugs = game.bugs.filter(b => !b.dead);
+
+  for (const doc of game.docs) {
+    doc.y += doc.speed * dt; doc.sway += dt * 2; doc.x += Math.sin(doc.sway) * 8 * dt;
+    if (face.open && Math.hypot(doc.x - face.mx, doc.y - face.my) < face.r * 0.6 + 4) {
+      doc.gone = true; game.score += 42; game.docCount++; pop("+42", doc.x, doc.y - 8, INK.C);
+      burst(doc.x, doc.y, [INK.W, INK.C, INK.Y], 8); SFX.eat();
+    }
+    if (doc.y > LH + 10) doc.gone = true;
+  }
+  game.docs = game.docs.filter(d => !d.gone);
+
+  if (game.hearts <= 0) {
+    game.mode = "over"; game.overAt = now; SFX.over();
+    if (game.score > game.hi) { game.hi = game.score; try { localStorage.setItem("bug-hunt-cam-hi", String(game.hi)); } catch { /* optional */ } }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------------------------
+function drawHelmet(face, t) {
+  const { x, y, r } = face, hurt = game.safe > 0 && Math.floor(t * 12) % 2 === 0;
+  ring(x, y, r + 1, INK.k); ring(x, y, r - 2, INK.k);
+  ring(x, y, r, hurt ? INK.R : INK.W); ring(x, y, r - 1, hurt ? INK.R : INK.L);
+  ring(x, y, r - 4, INK.C, Math.PI * 1.08, Math.PI * 1.38);                   // visor glint
+  line(x, y - r - 1, x, y - r - 6, INK.L);                                    // antenna
+  dot(x, y - r - 7, Math.floor(t * 3) % 2 ? INK.R : INK.r);
+  const w = Math.max(3, r * 0.28), h = face.open ? Math.max(2, face.gape * r * 2.2) : 0;   // mouth read-out
+  ctx.fillStyle = face.open ? INK.Y : INK.A;
+  if (h) { ctx.fillRect(Math.round(face.mx - w), Math.round(face.my - h / 2), Math.round(w * 2), 1);
+           ctx.fillRect(Math.round(face.mx - w), Math.round(face.my + h / 2), Math.round(w * 2), 1);
+           ctx.fillRect(Math.round(face.mx - w), Math.round(face.my - h / 2), 1, Math.round(h));
+           ctx.fillRect(Math.round(face.mx + w), Math.round(face.my - h / 2), 1, Math.round(h) + 1); }
+  else ctx.fillRect(Math.round(face.mx - w), Math.round(face.my), Math.round(w * 2), 1);
+}
+function drawHand(hand) {
+  if (hand.pts) {
+    for (const [a, b] of HAND_BONES) line(hand.pts[a].x, hand.pts[a].y, hand.pts[b].x, hand.pts[b].y, INK.T);
+    for (const p of hand.pts) dot(p.x, p.y, INK.W);
+  }
+  for (const tip of [hand.thumb, hand.index]) {
+    ctx.fillStyle = INK.k; ctx.fillRect(Math.round(tip.x) - 2, Math.round(tip.y) - 2, 5, 5);
+    ctx.fillStyle = hand.pinch ? INK.Y : INK.C; ctx.fillRect(Math.round(tip.x) - 1, Math.round(tip.y) - 1, 3, 3);
+  }
+  if (hand.pinch) { ring(hand.x, hand.y, 6, INK.Y); ring(hand.x, hand.y, 7, INK.k); }
+}
+function drawObject(o) {
+  const x0 = Math.round(o.x), y0 = Math.round(o.y), x1 = Math.round(o.x + o.w), y1 = Math.round(o.y + o.h), n = 5;
+  const color = o.name === "cup" || o.name === "book" ? INK.Y : INK.C;
+  ctx.fillStyle = color;
+  for (const [cx, cy, sx, sy] of [[x0, y0, 1, 1], [x1, y0, -1, 1], [x0, y1, 1, -1], [x1, y1, -1, -1]]) {
+    ctx.fillRect(Math.min(cx, cx + sx * n), cy, n + 1, 1); ctx.fillRect(cx, Math.min(cy, cy + sy * n), 1, n + 1);
+  }
+  const label = `${LABELS_DE[o.name] || o.name} ${Math.round(o.score * 100)}`;
+  drawText(label, Math.max(2, Math.min(LW - textWidth(label) - 2, x0)), Math.max(26, y0 - 10), color);
+}
+function drawScannerHud() {
+  drawText("SCANNER", 4, 4, INK.C);
+  drawText(`FUNDE ${String(game.finds).padStart(2, "0")}`, LW - 4, 4, INK.W, "right");
+  const label = `SUCHE: ${LABELS_DE[game.target] || game.target}`;
+  ctx.fillStyle = "rgba(17,10,48,.7)"; ctx.fillRect(0, 14, LW, 13);
+  drawText(label, LW / 2, 17, INK.Y, "center");
+  drawText("TIPPEN = WEITER", LW / 2, LH - 26, INK.A, "center");
+}
+function drawHud(t) {
+  if (game.mode === "scan") return drawScannerHud();
+  drawText(`SCORE ${String(game.score).padStart(6, "0")}`, 4, 4, INK.Y);
+  for (let i = 0; i < 3; i++) drawSprite(i < game.hearts ? HEART : HEART_LOST, LW - 8 - (2 - i) * 9, 8);
+  ctx.drawImage(DOC, 3, 13); drawText(`X${String(game.docCount).padStart(2, "0")}`, 14, 15, INK.W);
+  drawText(`HI ${String(game.hi).padStart(6, "0")}`, LW - 4, 15, INK.L, "right");
+  if (game.boost > 0) { ctx.drawImage(CUP, 3, 25); drawText(`KAFFEE ${Math.ceil(game.boost)}`, 14, 26, INK.C); }
+  if (game.mode === "play" && !input.face && Math.floor(t * 2) % 2) drawText("GESICHT FEHLT", LW / 2, LH - 26, INK.R, "center");
+  if (game.demo) drawText("DEMO", LW / 2, LH - 14, INK.A, "center");
+}
+function drawGameOver() {
+  ctx.fillStyle = "rgba(17,10,48,.6)"; ctx.fillRect(0, LH / 2 - 30, LW, 60);
+  drawText("GAME OVER", LW / 2, LH / 2 - 22, INK.R, "center");
+  drawText(`SCORE ${game.score}`, LW / 2, LH / 2 - 8, INK.Y, "center");
+  drawText(game.score >= game.hi && game.score > 0 ? "NEUER REKORD!" : `HI ${game.hi}`, LW / 2, LH / 2 + 4, INK.W, "center");
+  drawText("KNEIFEN = NEUSTART", LW / 2, LH / 2 + 18, INK.C, "center");
+}
+function render(t) {
+  if (game.demo) drawDemoBackdrop(t); else if (video.readyState >= 2) drawCameraFrame();
+  ditherToPalette();
+  ctx.imageSmoothingEnabled = false;
+  ctx.save();
+  if (game.shake > 0) ctx.translate(Math.round(rand(-2, 2)), Math.round(rand(-2, 2)));
+  for (const o of input.objects) drawObject(o);
+  if (input.face) drawHelmet(input.face, t);
+  for (const doc of game.docs) drawSprite(DOC, doc.x, doc.y);
+  for (const bug of game.bugs) drawSprite(BUGS[bug.kind][Math.floor(t * 6 + bug.wobble) % 2][bug.dy > 0 ? 1 : 0], bug.x, bug.y);
+  for (const hand of input.hands) drawHand(hand);
+  for (const b of game.bits) dot(b.x, b.y, b.color);
+  for (const p of game.pops) drawText(p.text, p.x, p.y, p.color, "center");
+  ctx.restore();
+  if (game.flash > 0) { ctx.fillStyle = "rgba(244,64,90,.35)"; ctx.fillRect(0, 0, LW, LH); }
+  drawHud(t);
+  if (game.mode === "over") drawGameOver();
+}
+
+let lastTick = performance.now();
+function tick(now) {
+  const dt = Math.min(0.05, (now - lastTick) / 1000); lastTick = now;
+  if (game.mode !== "idle") {
+    if (!game.demo) recognize(now); else if (game.mode !== "scan") demoInput(now / 1000, now);
+    update(dt, now);
+    render(now / 1000);
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+window.bugHunt = { game, input };                          // handy in the console
+
+// ---------------------------------------------------------------------------------------------
+// Start-up and controls
+// ---------------------------------------------------------------------------------------------
+const statusLine = $("#status");
+const report = (text, isError = false) => { statusLine.textContent = text; statusLine.classList.toggle("error", isError); };
+
+function cameraErrorText(err) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    return "Hier gibt es keinen Kamerazugriff. Die Seite braucht https oder localhost.";
+  if (err && (err.name === "NotAllowedError" || err.name === "SecurityError"))
+    return "Der Kamerazugriff wurde abgelehnt. Erlaube die Kamera in der Adressleiste und starte neu.";
+  if (err && (err.name === "NotFoundError" || err.name === "OverconstrainedError")) return "Es wurde keine Kamera gefunden.";
+  if (err && err.name === "NotReadableError") return "Die Kamera ist belegt. Schließe andere Programme, die sie nutzen.";
+  return "Die Kamera ließ sich nicht starten: " + (err && err.message ? err.message : err);
+}
+function enterGame(demo) {
+  game.demo = demo; resetGame();
+  $("#panel").hidden = true; $("#tools").hidden = false; $("#mode").hidden = demo;
+}
+let facing = "user";
+async function openCamera(wanted) {
+  if (video.srcObject) video.srcObject.getTracks().forEach(track => track.stop());
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false, video: { facingMode: { ideal: wanted }, width: { ideal: 640 }, height: { ideal: 480 } } });
+  video.srcObject = stream; await video.play();
+  const actual = stream.getVideoTracks()[0].getSettings().facingMode;        // desktops often report nothing
+  mirror = (actual || wanted) !== "environment";
+  facing = wanted; lastVideoTime = -1;
+}
+// Phones open one camera at a time, so the two cameras are two modes: selfie = bug hunt, rear = scanner.
+async function switchMode() {
+  const wanted = facing === "user" ? "environment" : "user";
+  $("#mode").disabled = true;
+  try {
+    await openCamera(wanted);
+  } catch (err) {
+    console.error(err);
+    try { await openCamera(facing); } catch { /* keep going without a picture */ }
+    pop("KAMERA FEHLT", LW / 2, LH / 2, INK.R);
+    $("#mode").disabled = false; return;
+  }
+  input.hands = []; input.objects = []; input.face = null;
+  if (facing === "environment") resetScanner(); else resetGame();
+  $("#mode").textContent = facing === "environment" ? "Spiel" : "Scanner";
+  $("#mode").disabled = false;
+}
+async function startCamera() {
+  $("#start").disabled = true;
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch { audio = null; }
+  try {
+    report("Starte Kamera …");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no mediaDevices");
+    await openCamera("user");
+  } catch (err) { report(cameraErrorText(err), true); $("#start").disabled = false; return; }
+  try {
+    detectors = await loadDetectors(report);
+  } catch (err) {
+    console.error(err);
+    report("Die Erkennung ließ sich nicht laden. Prüfe die Internetverbindung und starte neu.", true);
+    $("#start").disabled = false; return;
+  }
+  report("");
+  enterGame(false);
+}
+$("#start").addEventListener("click", startCamera);
+$("#demo").addEventListener("click", () => {
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch { audio = null; }
+  enterGame(true);
+});
+$("#mode").addEventListener("click", switchMode);
+$("#palette").addEventListener("click", () => { paletteIndex = (paletteIndex + 1) % PALETTES.length; });
+$("#sound").addEventListener("click", () => { muted = !muted; $("#sound").textContent = muted ? "Ton an" : "Ton aus"; });
+screen.addEventListener("click", () => {
+  if (game.mode === "over" && performance.now() - game.overAt > 800) resetGame();
+  else if (game.mode === "scan") nextTarget();
+});
+addEventListener("keydown", e => {
+  if (e.key === "p" || e.key === "P") $("#palette").click();
+  if (e.key === "m" || e.key === "M") $("#sound").click();
+  if (e.key === " " && game.mode === "over") resetGame();
+});
+if (location.hash === "#demo") enterGame(true);
+if (location.hash === "#scan") { enterGame(true); resetScanner(); }           // layout check for the scanner HUD
+if (location.hash === "#auto") startCamera();
+</script>
+</body>
+</html>
