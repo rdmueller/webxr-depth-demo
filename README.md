@@ -16,7 +16,7 @@ Ein zweites Experiment im Unterordner `bug-hunt-cam/`: ein Webcam-Spiel im Pixel
 
 Eine einzelne `index.html`. Bibliothek und Modelle lädt sie beim Start von jsDelivr und Google Storage, das Kamerabild bleibt im Browser.
 
-Unten links steht eine Diagnosezeile, zum Beispiel `H12 F18 OC140 28FPS`: Millisekunden pro Durchlauf für Hand-, Gesichts- und Bilderkennung, `C` heißt CPU statt Grafikchip, `-` heißt abgeschaltet. Friert die Seite in einer Erkennung ein, merkt sie sich das: Beim nächsten Start läuft diese Erkennung auf der CPU, beim zweiten Mal bleibt sie aus. `?gpu` an der Adresse setzt das zurück, `?cpu` erzwingt die CPU für alle. Die folgenden Abschnitte beschreiben die WebXR-Demo.
+Unten links steht eine Diagnosezeile, zum Beispiel `H12 F18 OC140 28FPS`: Millisekunden pro Durchlauf für Hand-, Gesichts- und Bilderkennung, `C` heißt CPU statt Grafikchip, `-` heißt abgeschaltet. Friert die Seite in einer Erkennung ein, merkt sie sich das: Beim nächsten Start läuft diese Erkennung auf der CPU, beim zweiten Mal bleibt sie aus. `?gpu` an der Adresse setzt das zurück, `?cpu` erzwingt die CPU für alle. Wirft eine Erkennung auf dem Grafikchip Fehler, wird sie auf der CPU neu aufgebaut. Der Knopf „Info" zeigt Version, Gerät, Zeiten und die vollständigen Fehlermeldungen zum Kopieren. Die folgenden Abschnitte beschreiben die WebXR-Demo.
 
 ## Voraussetzungen
 
