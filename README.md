@@ -14,7 +14,9 @@ Ein zweites Experiment im Unterordner `bug-hunt-cam/`: ein Webcam-Spiel im Pixel
 - Eine Tasse vor der Kamera bremst die Bugs, ein Buch gibt ein Herz zurück.
 - „Scanner" schaltet auf die Rückkamera und startet eine Schnitzeljagd nach Gegenständen.
 
-Eine einzelne `index.html`. Bibliothek und Modelle lädt sie beim Start von jsDelivr und Google Storage, das Kamerabild bleibt im Browser. Die folgenden Abschnitte beschreiben die WebXR-Demo.
+Eine einzelne `index.html`. Bibliothek und Modelle lädt sie beim Start von jsDelivr und Google Storage, das Kamerabild bleibt im Browser.
+
+Unten links steht eine Diagnosezeile, zum Beispiel `H12 F18 OC140 28FPS`: Millisekunden pro Durchlauf für Hand-, Gesichts- und Bilderkennung, `C` heißt CPU statt Grafikchip, `-` heißt abgeschaltet. Friert die Seite in einer Erkennung ein, merkt sie sich das: Beim nächsten Start läuft diese Erkennung auf der CPU, beim zweiten Mal bleibt sie aus. `?gpu` an der Adresse setzt das zurück, `?cpu` erzwingt die CPU für alle. Die folgenden Abschnitte beschreiben die WebXR-Demo.
 
 ## Voraussetzungen
 

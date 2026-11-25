@@ -21,16 +21,16 @@
   }
   html, body { height: 100%; margin: 0; background: var(--night); color: var(--ink); overflow: hidden;
                font-family: var(--font-display); touch-action: manipulation; }
-  #stage { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; background: var(--night); z-index: 1; }
   #screen { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
-  #cam { position: fixed; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+  #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; z-index: 0; }
   /* scanlines and vignette, sized to the game pixel */
-  #crt { position: fixed; inset: 0; pointer-events: none;
+  #crt { position: fixed; inset: 0; pointer-events: none; z-index: 2;
          background:
            radial-gradient(ellipse at 50% 50%, transparent 55%, rgba(8, 4, 26, .55) 100%),
            linear-gradient(to bottom, transparent 0 68%, rgba(8, 4, 26, .28) 68% 100%);
          background-size: 100% 100%, 100% var(--px, 6px); }
-  #panel { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; box-sizing: border-box;
+  #panel { position: fixed; inset: 0; z-index: 3; display: grid; place-items: center; padding: 16px; box-sizing: border-box;
            background: rgba(17, 10, 48, .82); overflow: auto; }
   #panel[hidden] { display: none; }
   .card { width: min(100%, 560px); box-sizing: border-box; padding: 24px 20px; background: var(--night);
@@ -52,7 +52,7 @@
   #status { color: var(--cyan); min-height: 2em; }
   #status.error { color: #ff8fa3; }
   .note { color: #b9a6dc; font-size: 9px; }
-  #tools { position: fixed; right: 10px; bottom: 10px; display: flex; gap: 10px; }
+  #tools { position: fixed; right: 10px; bottom: 10px; z-index: 3; display: flex; gap: 10px; }
   #tools[hidden] { display: none; }
   #tools button { font-size: 9px; padding: 10px 12px; opacity: .85; }
 </style>
@@ -92,7 +92,7 @@
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
-const VERSION = "1.0.0";                                   // shown on the start card, raise by hand on every change
+const VERSION = "1.1.0";                                   // shown on the start card, raise by hand on every change
 document.querySelector("#version").textContent = "Version " + VERSION;
 const query = new URLSearchParams(location.search);
 // Self-hosting: pass ?mp=<folder with vision_bundle.mjs and wasm/> and ?models=<folder with the three model files>.
@@ -209,6 +209,7 @@ function line(x0, y0, x1, y1, color) {                       // Bresenham
   }
 }
 function ring(cx, cy, r, color, from = 0, to = Math.PI * 2) {
+  if (!Number.isFinite(cx + cy + r) || r > 4000) return;
   ctx.fillStyle = color;
   const step = 0.6 / Math.max(r, 1);
   for (let a = from; a < to; a += step) ctx.fillRect(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), 1, 1);
@@ -286,30 +287,73 @@ function ditherToPalette() {
 // ---------------------------------------------------------------------------------------------
 const input = { face: null, faceSeen: 0, hands: [], objects: [] };
 const pinchMemory = [];
-let detectors = null, lastVideoTime = -1, frameCount = 0, lastObjectScan = 0;
+const DETECTOR_NAMES = { hand: "Handerkennung", face: "Gesichtserkennung", object: "Bilderkennung" };
+let detectors = null;                                       // name -> { task, delegate, ms, calls, lastTs }
 
 const mapPixel = (px, py) => ({ x: ((mirror ? video.videoWidth - px : px) - crop.x) / crop.w * LW, y: (py - crop.y) / crop.h * LH });
 const mapPoint = p => mapPixel(p.x * video.videoWidth, p.y * video.videoHeight);
+
+// A detector that freezes the page cannot report it. So each early call leaves a breadcrumb first.
+// If the breadcrumb is still there on the next visit, that detector moves from GPU to CPU, and on a second freeze it is switched off.
+const store = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch { /* optional */ } },
+  list(key) { return new Set((this.get(key) || "").split(",").filter(Boolean)); },
+};
+const settings = { cpu: store.list("bug-hunt-cam-cpu"), off: store.list("bug-hunt-cam-off"), stuck: store.get("bug-hunt-cam-busy") };
+if (query.has("gpu")) { settings.cpu.clear(); settings.off.clear(); settings.stuck = null; }      // ?gpu forgets all of this
+if (query.has("cpu")) Object.keys(DETECTOR_NAMES).forEach(name => settings.cpu.add(name));
+if (settings.stuck && DETECTOR_NAMES[settings.stuck]) (settings.cpu.has(settings.stuck) ? settings.off : settings.cpu).add(settings.stuck);
+store.set("bug-hunt-cam-busy", null);
+store.set("bug-hunt-cam-cpu", [...settings.cpu].join(",") || null);
+store.set("bug-hunt-cam-off", [...settings.off].join(",") || null);
+
+const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+function runDetector(name, now) {
+  const d = detectors && detectors[name];
+  if (!d) return null;
+  const early = d.calls < 20;
+  if (early) store.set("bug-hunt-cam-busy", name);
+  const started = performance.now();
+  d.lastTs = Math.max(now, d.lastTs + 1);                   // timestamps must rise for each task
+  let result = null;
+  try { result = d.task.detectForVideo(video, d.lastTs); d.fails = 0; }
+  catch (err) {
+    noteError(err);
+    if (++d.fails >= 5) { delete detectors[name]; noteError(`${DETECTOR_NAMES[name]} abgeschaltet: ${(err && err.message) || err}`); }
+  }
+  const took = performance.now() - started;
+  d.ms = d.calls ? d.ms * 0.8 + took * 0.2 : took; d.calls++;
+  if (early) store.set("bug-hunt-cam-busy", null);
+  return result;
+}
 
 async function loadDetectors(report) {
   report("Lade Erkennung …");
   const mp = await import(`${MP_BASE}/vision_bundle.mjs`);
   const files = await mp.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
-  const create = async (Task, model, options) => {
+  const plan = [["hand", mp.HandLandmarker, { numHands: 2 }], ["face", mp.FaceLandmarker, { numFaces: 1 }],
+                ["object", mp.ObjectDetector, { scoreThreshold: 0.45, maxResults: 5 }]];
+  detectors = {};
+  for (const [name, Task, options] of plan) {
+    if (settings.off.has(name)) continue;
+    report(`Lade ${DETECTOR_NAMES[name]} …`);
+    const make = delegate => Task.createFromOptions(files, { baseOptions: { modelAssetPath: MODELS[name], delegate }, runningMode: "VIDEO", ...options });
+    let delegate = settings.cpu.has(name) ? "CPU" : "GPU", task;
     try {
-      return await Task.createFromOptions(files, { baseOptions: { modelAssetPath: model, delegate: "GPU" }, runningMode: "VIDEO", ...options });
-    } catch (gpuError) {
-      console.warn("GPU delegate failed, using CPU", gpuError);
-      return await Task.createFromOptions(files, { baseOptions: { modelAssetPath: model, delegate: "CPU" }, runningMode: "VIDEO", ...options });
+      try { task = await make(delegate); }
+      catch (err) { if (delegate === "CPU") throw err; console.warn("GPU delegate failed, using CPU", err); delegate = "CPU"; task = await make("CPU"); }
+    } catch (err) {
+      if (name !== "object") throw err;                     // the game works without object recognition
+      console.error(err); continue;
     }
-  };
-  report("Lade Handerkennung …");
-  const hand = await create(mp.HandLandmarker, MODELS.hand, { numHands: 2 });
-  report("Lade Gesichtserkennung …");
-  const face = await create(mp.FaceLandmarker, MODELS.face, { numFaces: 1 });
-  report("Lade Bilderkennung …");
-  const object = await create(mp.ObjectDetector, MODELS.object, { scoreThreshold: 0.45, maxResults: 5 });
-  return { hand, face, object };
+    detectors[name] = { task, delegate, ms: 0, calls: 0, lastTs: 0, fails: 0 };
+    report(`Teste ${DETECTOR_NAMES[name]} …`);              // the first run compiles shaders: do it here, not in the game
+    await nextFrame();
+    runDetector(name, performance.now());
+    await nextFrame();
+  }
 }
 
 function readHands(result, now) {
@@ -330,6 +374,7 @@ function readFace(result, previous) {
   if (!lm) return null;
   const top = mapPoint(lm[10]), chin = mapPoint(lm[152]), upper = mapPoint(lm[13]), lower = mapPoint(lm[14]);
   const height = dist(top, chin) || 1;
+  if (!Number.isFinite(height + top.x + top.y + upper.x + lower.y)) return null;
   const now = { x: (top.x + chin.x) / 2, y: (top.y + chin.y) / 2 - height * 0.06, r: height * 0.74,
                 mx: (upper.x + lower.x) / 2, my: (upper.y + lower.y) / 2, gape: dist(upper, lower) / height };
   if (previous) for (const key of ["x", "y", "r", "mx", "my"]) now[key] = previous[key] + (now[key] - previous[key]) * 0.6;
@@ -343,22 +388,34 @@ function readObjects(result) {
     return { name: cat.categoryName, score: cat.score, x: Math.min(p1.x, p2.x), y: p1.y, w: Math.abs(p2.x - p1.x), h: p2.y - p1.y };
   }).filter(o => o.name !== "person");
 }
+const due = { face: 0, object: 0 };
+let nextDetectAt = 0;
+function pickDetector(now) {
+  const scanning = game.mode === "scan";
+  if (detectors.object && now >= due.object) { due.object = now + (scanning ? 250 : 600); return "object"; }
+  if (!scanning && detectors.face && now >= due.face) { due.face = now + 90; return "face"; }
+  return detectors.hand ? "hand" : null;
+}
+function applyResult(name, result, now) {
+  if (name === "hand") input.hands = readHands(result, now);
+  else if (name === "object") input.objects = readObjects(result);
+  else {
+    const face = readFace(result, input.face);
+    if (face) { input.face = face; input.faceSeen = now; }
+    else if (now - input.faceSeen > 700) input.face = null;
+  }
+}
 function recognize(now) {
-  if (!detectors || video.readyState < 2 || video.currentTime === lastVideoTime) return;
-  lastVideoTime = video.currentTime; frameCount++;
-  try {
-    input.hands = readHands(detectors.hand.detectForVideo(video, now), now);
-    if (game.mode === "scan") input.face = null;
-    else if (frameCount % 2 === 0) {                                          // faces move slowly: every second frame is enough
-      const face = readFace(detectors.face.detectForVideo(video, now), input.face);
-      if (face) { input.face = face; input.faceSeen = now; }
-      else if (now - input.faceSeen > 700) input.face = null;
-    }
-    if (now - lastObjectScan > (game.mode === "scan" ? 200 : 450)) {
-      lastObjectScan = now;
-      input.objects = readObjects(detectors.object.detectForVideo(video, now));
-    }
-  } catch (err) { console.error("recognition failed", err); }
+  if (!detectors || video.readyState < 2 || now < nextDetectAt) return;
+  if (game.mode === "scan") input.face = null;
+  else if (!detectors.face) {                               // face recognition switched off: a fixed helmet keeps the game playable
+    const r = Math.min(LW, LH) * 0.18;
+    input.face = { x: LW / 2, y: LH / 2, r, mx: LW / 2, my: LH / 2 + r * 0.45, gape: 0, open: false }; input.faceSeen = now;
+  }
+  const started = performance.now(), name = pickDetector(now);
+  const result = name && runDetector(name, now);
+  if (result) { try { applyResult(name, result, now); } catch (err) { noteError(err); } }
+  nextDetectAt = now + Math.min(300, (performance.now() - started) * 0.5);
 }
 
 // Demo: a scripted player, so the page shows something without a camera.
@@ -537,13 +594,36 @@ function drawObject(o) {
   const label = `${LABELS_DE[o.name] || o.name} ${Math.round(o.score * 100)}`;
   drawText(label, Math.max(2, Math.min(LW - textWidth(label) - 2, x0)), Math.max(26, y0 - 10), color);
 }
+const bottomLine = () => LH - Math.ceil(64 / pixel) - 8;   // lowest text row that the buttons do not cover
+// e.g. "H12 F18 OC140 28FPS": milliseconds per run for hand, face, object; C = on the CPU, - = switched off
+function drawReadout() {
+  if (!detectors) return;
+  const parts = [["H", "hand"], ["F", "face"], ["O", "object"]].map(([letter, name]) => {
+    const d = detectors[name];
+    return d ? `${letter}${d.delegate === "CPU" ? "C" : ""}${Math.round(d.ms)}` : `${letter}-`;
+  });
+  drawText(`${parts.join(" ")} ${Math.round(fps)}FPS`, 3, bottomLine(), INK.A);
+}
+let lastError = null;
+function noteError(err) {
+  console.error(err);
+  lastError = { text: String((err && err.message) || err), until: performance.now() + 8000 };
+}
+function drawError(now) {
+  if (!lastError || now > lastError.until) return;
+  const perLine = Math.max(8, Math.floor((LW - 8) / 6)), text = ("FEHLER: " + lastError.text).toUpperCase();
+  const lines = []; for (let i = 0; i < text.length && lines.length < 5; i += perLine) lines.push(text.slice(i, i + perLine));
+  const top = Math.round(LH * 0.3);
+  ctx.fillStyle = "rgba(17,10,48,.85)"; ctx.fillRect(0, top - 4, LW, lines.length * 10 + 7);
+  lines.forEach((ln, i) => drawText(ln, 4, top + i * 10, INK.R));
+}
 function drawScannerHud() {
   drawText("SCANNER", 4, 4, INK.C);
   drawText(`FUNDE ${String(game.finds).padStart(2, "0")}`, LW - 4, 4, INK.W, "right");
   const label = `SUCHE: ${LABELS_DE[game.target] || game.target}`;
   ctx.fillStyle = "rgba(17,10,48,.7)"; ctx.fillRect(0, 14, LW, 13);
   drawText(label, LW / 2, 17, INK.Y, "center");
-  drawText("TIPPEN = WEITER", LW / 2, LH - 26, INK.A, "center");
+  drawText("TIPPEN = WEITER", LW / 2, bottomLine() - 11, INK.A, "center");
 }
 function drawHud(t) {
   if (game.mode === "scan") return drawScannerHud();
@@ -552,8 +632,8 @@ function drawHud(t) {
   ctx.drawImage(DOC, 3, 13); drawText(`X${String(game.docCount).padStart(2, "0")}`, 14, 15, INK.W);
   drawText(`HI ${String(game.hi).padStart(6, "0")}`, LW - 4, 15, INK.L, "right");
   if (game.boost > 0) { ctx.drawImage(CUP, 3, 25); drawText(`KAFFEE ${Math.ceil(game.boost)}`, 14, 26, INK.C); }
-  if (game.mode === "play" && !input.face && Math.floor(t * 2) % 2) drawText("GESICHT FEHLT", LW / 2, LH - 26, INK.R, "center");
-  if (game.demo) drawText("DEMO", LW / 2, LH - 14, INK.A, "center");
+  if (game.mode === "play" && !input.face && Math.floor(t * 2) % 2) drawText("GESICHT FEHLT", LW / 2, bottomLine() - 11, INK.R, "center");
+  if (game.demo) drawText("DEMO", LW / 2, bottomLine() - 11, INK.A, "center");
 }
 function drawGameOver() {
   ctx.fillStyle = "rgba(17,10,48,.6)"; ctx.fillRect(0, LH / 2 - 30, LW, 60);
@@ -581,18 +661,22 @@ function render(t) {
   if (game.mode === "over") drawGameOver();
 }
 
-let lastTick = performance.now();
+let lastTick = performance.now(), fps = 0;
 function tick(now) {
-  const dt = Math.min(0.05, (now - lastTick) / 1000); lastTick = now;
-  if (game.mode !== "idle") {
-    if (!game.demo) recognize(now); else if (game.mode !== "scan") demoInput(now / 1000, now);
-    update(dt, now);
-    render(now / 1000);
-  }
   requestAnimationFrame(tick);
+  const elapsed = now - lastTick; lastTick = now;
+  if (elapsed > 0) fps = fps ? fps * 0.9 + (1000 / elapsed) * 0.1 : 1000 / elapsed;
+  if (game.mode === "idle") return;
+  try {
+    if (!game.demo) recognize(now); else if (game.mode !== "scan") demoInput(now / 1000, now);
+    update(Math.min(0.05, elapsed / 1000), now);
+    render(now / 1000);
+    drawReadout();
+  } catch (err) { noteError(err); }
+  try { drawError(now); } catch { /* nothing left to try */ }
 }
 requestAnimationFrame(tick);
-window.bugHunt = { game, input };                          // handy in the console
+window.bugHunt = { game, input, settings, get detectors() { return detectors; } };                          // handy in the console
 
 // ---------------------------------------------------------------------------------------------
 // Start-up and controls
@@ -621,7 +705,7 @@ async function openCamera(wanted) {
   video.srcObject = stream; await video.play();
   const actual = stream.getVideoTracks()[0].getSettings().facingMode;        // desktops often report nothing
   mirror = (actual || wanted) !== "environment";
-  facing = wanted; lastVideoTime = -1;
+  facing = wanted;
 }
 // Phones open one camera at a time, so the two cameras are two modes: selfie = bug hunt, rear = scanner.
 async function switchMode() {
@@ -649,7 +733,7 @@ async function startCamera() {
     await openCamera("user");
   } catch (err) { report(cameraErrorText(err), true); $("#start").disabled = false; return; }
   try {
-    detectors = await loadDetectors(report);
+    await loadDetectors(report);
   } catch (err) {
     console.error(err);
     report("Die Erkennung ließ sich nicht laden. Prüfe die Internetverbindung und starte neu.", true);
@@ -675,6 +759,9 @@ addEventListener("keydown", e => {
   if (e.key === "m" || e.key === "M") $("#sound").click();
   if (e.key === " " && game.mode === "over") resetGame();
 });
+if (settings.stuck && DETECTOR_NAMES[settings.stuck]) {
+  report(`Beim letzten Start hing die ${DETECTOR_NAMES[settings.stuck]}. Sie ${settings.off.has(settings.stuck) ? "ist jetzt abgeschaltet" : "läuft jetzt ohne Grafikchip"}.`);
+}
 if (location.hash === "#demo") enterGame(true);
 if (location.hash === "#scan") { enterGame(true); resetScanner(); }           // layout check for the scanner HUD
 if (location.hash === "#auto") startCamera();
