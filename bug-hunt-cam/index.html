@@ -73,7 +73,7 @@
     <h1>BUG HUNT CAM</h1>
     <p>Die Webcam macht dich zur Pixel-Figur. Die Seite erkennt deine Hände, dein Gesicht und Gegenstände.</p>
     <ul>
-      <li><b>Kneifen</b>: Hand ins Bild halten und Daumen- und Zeigefingerspitze über einem Bug zusammentippen.</li>
+      <li><b>Kneifen</b>: Hand ins Bild halten und Daumen- und Zeigefingerspitze zusammentippen. Der gepunktete Kreis zeigt, wie weit dein Griff reicht.</li>
       <li><b>Mund auf</b> frisst Dokumente: +42 Punkte.</li>
       <li>Kein Bug darf deinen <b>Helm</b> erreichen. Du hast drei Herzen.</li>
       <li><b>Tasse</b> zeigen bremst die Bugs. <b>Buch</b> zeigen gibt ein Herz zurück.</li>
@@ -302,6 +302,9 @@ function ditherToPalette() {
 // ---------------------------------------------------------------------------------------------
 const input = { face: null, faceSeen: 0, hands: [], objects: [] };
 const pinchMemory = [];
+// A pinch closes below either "close" value and opens again above both "open" values. reach: catch radius in game pixels,
+// hotMs: how long a fresh pinch keeps catching.
+const PINCH = { closeMetres: 0.035, openMetres: 0.055, closeRatio: 0.32, openRatio: 0.5, reach: 22, hotMs: 500 };
 const DETECTOR_NAMES = { hand: "Handerkennung", face: "Gesichtserkennung", object: "Bilderkennung" };
 let detectors = null;                                       // name -> { task, delegate, ms, calls, lastTs }
 
@@ -399,12 +402,18 @@ async function loadDetectors(report) {
 function readHands(result, now) {
   const hands = (result.landmarks || []).map((lm, i) => {
     const pts = lm.map(mapPoint);
-    const gap = dist(pts[4], pts[8]) / (dist(pts[0], pts[9]) || 1);          // thumb tip to index tip, relative to palm
+    // thumb tip to index tip: on screen relative to the palm, and in metres from the 3D hand model
+    const palm = Math.max(dist(pts[0], pts[9]), dist(pts[5], pts[17]) * 1.2) || 1;
+    const gap2d = dist(pts[4], pts[8]) / palm;
+    const w = result.worldLandmarks && result.worldLandmarks[i];
+    const gap3d = w ? Math.hypot(w[4].x - w[8].x, w[4].y - w[8].y, w[4].z - w[8].z) : Infinity;
+    const closed = gap3d < PINCH.closeMetres || gap2d < PINCH.closeRatio;
+    const open = gap2d > PINCH.openRatio && (gap3d === Infinity || gap3d > PINCH.openMetres);
     const was = pinchMemory[i] || { down: false, since: 0 };
-    const down = was.down ? gap < 0.55 : gap < 0.35;                          // hysteresis against flicker
+    const down = was.down ? !open : closed;                                   // hysteresis against flicker
     pinchMemory[i] = { down, since: down && !was.down ? now : was.since };
     return { pts, thumb: pts[4], index: pts[8], x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2,
-             pinch: down, pinchSince: pinchMemory[i].since };
+             pinch: down, pinchSince: pinchMemory[i].since, gap2d, gap3d };
   });
   pinchMemory.length = hands.length;
   return hands;
@@ -567,7 +576,7 @@ function update(dt, now) {
     const a = Math.atan2(dy, dx) + Math.sin(bug.wobble) * 0.6;
     bug.x += Math.cos(a) * bug.speed * slow * dt; bug.y += Math.sin(a) * bug.speed * slow * dt; bug.dy = dy;
     for (const hand of input.hands) {
-      if (hand.pinch && now - hand.pinchSince < 350 && Math.hypot(hand.x - bug.x, hand.y - bug.y) < 13) {
+      if (hand.pinch && now - hand.pinchSince < PINCH.hotMs && Math.hypot(hand.x - bug.x, hand.y - bug.y) < PINCH.reach) {
         bug.dead = true; game.score += 10; pop("+10", bug.x, bug.y - 8);
         burst(bug.x, bug.y, [INK.Y, INK.O, INK.W, INK.R]); SFX.squash();
       }
@@ -622,7 +631,12 @@ function drawHand(hand) {
     ctx.fillStyle = INK.k; ctx.fillRect(Math.round(tip.x) - 2, Math.round(tip.y) - 2, 5, 5);
     ctx.fillStyle = hand.pinch ? INK.Y : INK.C; ctx.fillRect(Math.round(tip.x) - 1, Math.round(tip.y) - 1, 3, 3);
   }
-  if (hand.pinch) { ring(hand.x, hand.y, 6, INK.Y); ring(hand.x, hand.y, 7, INK.k); }
+  const hot = hand.pinch && performance.now() - hand.pinchSince < PINCH.hotMs;
+  if (hot) { ring(hand.x, hand.y, PINCH.reach, INK.Y); ring(hand.x, hand.y, PINCH.reach + 1, INK.k); }
+  else if (!hand.pinch) {
+    ctx.fillStyle = INK.C;
+    for (let a = 0; a < 6.283; a += 0.2) ctx.fillRect(Math.round(hand.x + Math.cos(a) * PINCH.reach), Math.round(hand.y + Math.sin(a) * PINCH.reach), 1, 1);
+  }
 }
 function drawObject(o) {
   const x0 = Math.round(o.x), y0 = Math.round(o.y), x1 = Math.round(o.x + o.w), y1 = Math.round(o.y + o.h), n = 5;
@@ -666,6 +680,9 @@ function infoText() {
     const d = detectors && detectors[name];
     lines.push(d ? `${name}: ${d.delegate}, ${d.ms.toFixed(1)} ms, ${d.calls} Läufe, ${d.fails} Fehler in Folge` : `${name}: aus`);
   }
+  lines.push(input.hands.length ? "" : "Keine Hand im Bild.");
+  input.hands.forEach((h, i) => lines.push(`Hand ${i + 1}: Abstand ${Number.isFinite(h.gap3d) ? (h.gap3d * 100).toFixed(1) + " cm" : "?"}, ` +
+    `Verhältnis ${h.gap2d === undefined ? "?" : h.gap2d.toFixed(2)}, Kneifen ${h.pinch ? "ja" : "nein"}`));
   lines.push(`Gemerkt: CPU [${[...settings.cpu]}], aus [${[...settings.off]}]`, "", problems.length ? "Meldungen:" : "Keine Meldungen.");
   for (const p of problems) lines.push(`${p.count}x ${p.text}`, "");
   return lines.join("\n");
