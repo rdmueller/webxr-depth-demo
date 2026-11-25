@@ -16,7 +16,9 @@ Ein zweites Experiment im Unterordner `bug-hunt-cam/`: ein Webcam-Spiel im Pixel
 
 Eine einzelne `index.html`. Bibliothek und Modelle lädt sie beim Start von jsDelivr und Google Storage, das Kamerabild bleibt im Browser.
 
-Unten links steht eine Diagnosezeile, zum Beispiel `H12 F18 OC140 28FPS`: Millisekunden pro Durchlauf für Hand-, Gesichts- und Bilderkennung, `C` heißt CPU statt Grafikchip, `-` heißt abgeschaltet. Friert die Seite in einer Erkennung ein, merkt sie sich das: Beim nächsten Start läuft diese Erkennung auf der CPU, beim zweiten Mal bleibt sie aus. `?gpu` an der Adresse setzt das zurück, `?cpu` erzwingt die CPU für alle. Wirft eine Erkennung auf dem Grafikchip Fehler, wird sie auf der CPU neu aufgebaut. Der Knopf „Info" zeigt Version, Gerät, Zeiten und die vollständigen Fehlermeldungen zum Kopieren. Die folgenden Abschnitte beschreiben die WebXR-Demo.
+Die Erkennung läuft auf der CPU. Der Grafikchip-Pfad lieferte auf einem Galaxy S25 (Edge 157) falsche Werte: Die Gesichtserkennung brach mit `ROI contains NaN values` ab, die Handerkennung fand keine Hand. `?gpu` an der Adresse schaltet den Grafikchip ein; scheitert eine Erkennung dort, wird sie auf der CPU neu aufgebaut.
+
+Unten links steht eine Diagnosezeile, zum Beispiel `HC30 FC28 OC120 28FPS`: Millisekunden pro Durchlauf für Hand-, Gesichts- und Bilderkennung, `C` heißt CPU, `-` heißt abgeschaltet. Der Knopf „Info" zeigt Version, Gerät, Zeiten, Handmesswerte und die vollständigen Fehlermeldungen zum Kopieren.
 
 ## Voraussetzungen
 

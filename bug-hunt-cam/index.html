@@ -73,9 +73,9 @@
     <h1>BUG HUNT CAM</h1>
     <p>Die Webcam macht dich zur Pixel-Figur. Die Seite erkennt deine Hände, dein Gesicht und Gegenstände.</p>
     <ul>
-      <li><b>Kneifen</b>: Hand ins Bild halten und Daumen- und Zeigefingerspitze zusammentippen. Der gepunktete Kreis zeigt, wie weit dein Griff reicht.</li>
+      <li><b>Kneifen</b>: Hand ins Bild halten und Daumen- und Zeigefingerspitze zusammentippen. Der gepunktete Kreis um die Finger zeigt, wie weit dein Griff reicht. Antippen auf dem Bildschirm geht auch.</li>
       <li><b>Mund auf</b> frisst Dokumente: +42 Punkte.</li>
-      <li>Kein Bug darf deinen <b>Helm</b> erreichen. Du hast drei Herzen.</li>
+      <li>Kein Bug darf die <b>Mitte deines Gesichts</b> erreichen, den gepunkteten Kreis. Du hast drei Herzen.</li>
       <li><b>Tasse</b> zeigen bremst die Bugs. <b>Buch</b> zeigen gibt ein Herz zurück.</li>
       <li><b>Scanner</b> schaltet auf die Rückkamera: Finde den Gegenstand, der oben steht.</li>
     </ul>
@@ -107,7 +107,7 @@
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
-const VERSION = "1.2.0";                                   // shown on the start card, raise by hand on every change
+const VERSION = "1.3.0";                                   // shown on the start card, raise by hand on every change
 document.querySelector("#version").textContent = "Version " + VERSION;
 const query = new URLSearchParams(location.search);
 // Self-hosting: pass ?mp=<folder with vision_bundle.mjs and wasm/> and ?models=<folder with the three model files>.
@@ -229,6 +229,12 @@ function ring(cx, cy, r, color, from = 0, to = Math.PI * 2) {
   const step = 0.6 / Math.max(r, 1);
   for (let a = from; a < to; a += step) ctx.fillRect(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), 1, 1);
 }
+function dottedRing(cx, cy, r, color) {
+  if (!Number.isFinite(cx + cy + r) || r > 4000) return;
+  ctx.fillStyle = color;
+  const step = Math.max(0.05, 5 / Math.max(r, 1));
+  for (let a = 0; a < 6.283; a += step) ctx.fillRect(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r), 1, 1);
+}
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const rand = (a, b) => a + Math.random() * (b - a);
 
@@ -319,8 +325,10 @@ const store = {
   list(key) { return new Set((this.get(key) || "").split(",").filter(Boolean)); },
 };
 const settings = { cpu: store.list("bug-hunt-cam-cpu"), off: store.list("bug-hunt-cam-off"), stuck: store.get("bug-hunt-cam-busy") };
-if (query.has("gpu")) { settings.cpu.clear(); settings.off.clear(); settings.stuck = null; }      // ?gpu forgets all of this
-if (query.has("cpu")) Object.keys(DETECTOR_NAMES).forEach(name => settings.cpu.add(name));
+// The CPU is the default. On a Galaxy S25 (Edge 157) the GPU path produced NaN boxes for the face model ("ROI contains NaN
+// values") and silently found no hands. ?gpu opts in to the GPU and forgets earlier fallbacks.
+const preferGpu = query.has("gpu");
+if (preferGpu) { settings.cpu.clear(); settings.off.clear(); settings.stuck = null; }
 if (settings.stuck && DETECTOR_NAMES[settings.stuck]) (settings.cpu.has(settings.stuck) ? settings.off : settings.cpu).add(settings.stuck);
 store.set("bug-hunt-cam-busy", null);
 store.set("bug-hunt-cam-cpu", [...settings.cpu].join(",") || null);
@@ -381,7 +389,7 @@ async function loadDetectors(report) {
     report(`Lade ${DETECTOR_NAMES[name]} …`);
     makers[name] = delegate => Task.createFromOptions(files, { baseOptions: { modelAssetPath: MODELS[name], delegate }, runningMode: "VIDEO", ...options });
     let ready = false;
-    for (const delegate of settings.cpu.has(name) ? ["CPU"] : ["GPU", "CPU"]) {
+    for (const delegate of preferGpu && !settings.cpu.has(name) ? ["GPU", "CPU"] : ["CPU"]) {
       try {
         const task = await makers[name](delegate);
         detectors[name] = { task, delegate, ms: 0, calls: 0, lastTs: 0, fails: 0 };
@@ -413,7 +421,7 @@ function readHands(result, now) {
     const down = was.down ? !open : closed;                                   // hysteresis against flicker
     pinchMemory[i] = { down, since: down && !was.down ? now : was.since };
     return { pts, thumb: pts[4], index: pts[8], x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2,
-             pinch: down, pinchSince: pinchMemory[i].since, gap2d, gap3d };
+             pinch: down, pinchSince: pinchMemory[i].since, gap2d, gap3d, reach: Math.max(PINCH.reach, palm * 0.6) };
   });
   pinchMemory.length = hands.length;
   return hands;
@@ -441,7 +449,7 @@ const due = { face: 0, object: 0 };
 let nextDetectAt = 0;
 function pickDetector(now) {
   const scanning = game.mode === "scan";
-  if (detectors.object && now >= due.object) { due.object = now + (scanning ? 250 : 600); return "object"; }
+  if (detectors.object && now >= due.object) { due.object = now + (scanning ? 350 : 900); return "object"; }
   if (!scanning && detectors.face && now >= due.face) { due.face = now + 90; return "face"; }
   return detectors.hand ? "hand" : null;
 }
@@ -515,14 +523,23 @@ function updateScanner(dt) {
 }
 function resetGame() {
   Object.assign(game, { mode: "play", t: 0, score: 0, hearts: 3, docCount: 0, bugs: [], docs: [], bits: [], pops: [],
-                        spawnIn: 1.5, docIn: 3, shake: 0, flash: 0, safe: 0, boost: 0, boostCooldown: 0, bookCooldown: 0 });
+                        spawnIn: 2.5, docIn: 3, shake: 0, flash: 0, safe: 0, boost: 0, boostCooldown: 0, bookCooldown: 0 });
 }
-function spawnBug() {
+// The bite zone is the middle of the face, not the whole helmet: bugs crawl across your face before they bite.
+const biteRadius = face => face.r * 0.4;
+function spawnBug(face) {
   const side = (Math.random() * 4) | 0;
   const pos = side === 0 ? { x: rand(0, LW), y: -8 } : side === 1 ? { x: LW + 8, y: rand(0, LH) }
             : side === 2 ? { x: rand(0, LW), y: LH + 8 } : { x: -8, y: rand(0, LH) };
-  game.bugs.push({ ...pos, speed: rand(8, 12) + Math.min(16, game.t * 0.2), wobble: rand(0, 6.28), kind: (Math.random() * 4) | 0, dy: 1 });
+  const travel = Math.max(20, Math.hypot(face.x - pos.x, face.y - pos.y) - biteRadius(face));
+  const seconds = Math.max(4.5, 9 - game.t * 0.04) * rand(0.85, 1.15);       // time to reach the face, whatever its size
+  game.bugs.push({ ...pos, speed: travel / seconds, wobble: rand(0, 6.28), kind: (Math.random() * 4) | 0, dy: 1 });
 }
+function squash(bug) {
+  bug.dead = true; game.score += 10; pop("+10", bug.x, bug.y - 8);
+  burst(bug.x, bug.y, [INK.Y, INK.O, INK.W, INK.R]); SFX.squash();
+}
+const taps = [];                                            // touches on the screen squash bugs too
 function burst(x, y, colors, n = 12) {
   for (let i = 0; i < n; i++) {
     const a = rand(0, 6.28), s = rand(15, 60);
@@ -565,7 +582,7 @@ function update(dt, now) {
   if (!face) return;                                          // no face, no fight: the game waits
 
   game.spawnIn -= dt;
-  if (game.spawnIn <= 0) { spawnBug(); game.spawnIn = Math.max(0.7, 2.0 - game.t * 0.015) * rand(0.7, 1.3); }
+  if (game.spawnIn <= 0) { spawnBug(face); game.spawnIn = Math.max(0.9, 2.4 - game.t * 0.015) * rand(0.7, 1.3); }
   game.docIn -= dt;
   if (game.docIn <= 0) { game.docs.push({ x: rand(12, LW - 12), y: -8, speed: rand(12, 20), sway: rand(0, 6.28) }); game.docIn = rand(2.5, 5); }
 
@@ -576,21 +593,21 @@ function update(dt, now) {
     const a = Math.atan2(dy, dx) + Math.sin(bug.wobble) * 0.6;
     bug.x += Math.cos(a) * bug.speed * slow * dt; bug.y += Math.sin(a) * bug.speed * slow * dt; bug.dy = dy;
     for (const hand of input.hands) {
-      if (hand.pinch && now - hand.pinchSince < PINCH.hotMs && Math.hypot(hand.x - bug.x, hand.y - bug.y) < PINCH.reach) {
-        bug.dead = true; game.score += 10; pop("+10", bug.x, bug.y - 8);
-        burst(bug.x, bug.y, [INK.Y, INK.O, INK.W, INK.R]); SFX.squash();
-      }
+      if (!bug.dead && hand.pinch && now - hand.pinchSince < PINCH.hotMs
+          && Math.hypot(hand.x - bug.x, hand.y - bug.y) < (hand.reach || PINCH.reach)) squash(bug);
     }
-    if (!bug.dead && d < face.r + 3) {
+    for (const tap of taps) if (!bug.dead && Math.hypot(tap.x - bug.x, tap.y - bug.y) < 16) squash(bug);
+    if (!bug.dead && d < biteRadius(face) + 3) {
       bug.dead = true; burst(bug.x, bug.y, [INK.R, INK.W, INK.M], 16);
       if (game.safe === 0) { game.hearts--; game.safe = 1.2; game.shake = 0.35; game.flash = 0.25; SFX.hit(); }
     }
   }
   game.bugs = game.bugs.filter(b => !b.dead);
+  taps.length = 0;
 
   for (const doc of game.docs) {
     doc.y += doc.speed * dt; doc.sway += dt * 2; doc.x += Math.sin(doc.sway) * 8 * dt;
-    if (face.open && Math.hypot(doc.x - face.mx, doc.y - face.my) < face.r * 0.6 + 4) {
+    if (face.open && Math.hypot(doc.x - face.mx, doc.y - face.my) < Math.max(12, face.r * 0.35)) {
       doc.gone = true; game.score += 42; game.docCount++; pop("+42", doc.x, doc.y - 8, INK.C);
       burst(doc.x, doc.y, [INK.W, INK.C, INK.Y], 8); SFX.eat();
     }
@@ -612,6 +629,7 @@ function drawHelmet(face, t) {
   ring(x, y, r + 1, INK.k); ring(x, y, r - 2, INK.k);
   ring(x, y, r, hurt ? INK.R : INK.W); ring(x, y, r - 1, hurt ? INK.R : INK.L);
   ring(x, y, r - 4, INK.C, Math.PI * 1.08, Math.PI * 1.38);                   // visor glint
+  if (game.mode === "play") dottedRing(x, y, biteRadius(face), hurt ? INK.R : INK.M);
   line(x, y - r - 1, x, y - r - 6, INK.L);                                    // antenna
   dot(x, y - r - 7, Math.floor(t * 3) % 2 ? INK.R : INK.r);
   const w = Math.max(3, r * 0.28), h = face.open ? Math.max(2, face.gape * r * 2.2) : 0;   // mouth read-out
@@ -631,12 +649,9 @@ function drawHand(hand) {
     ctx.fillStyle = INK.k; ctx.fillRect(Math.round(tip.x) - 2, Math.round(tip.y) - 2, 5, 5);
     ctx.fillStyle = hand.pinch ? INK.Y : INK.C; ctx.fillRect(Math.round(tip.x) - 1, Math.round(tip.y) - 1, 3, 3);
   }
-  const hot = hand.pinch && performance.now() - hand.pinchSince < PINCH.hotMs;
-  if (hot) { ring(hand.x, hand.y, PINCH.reach, INK.Y); ring(hand.x, hand.y, PINCH.reach + 1, INK.k); }
-  else if (!hand.pinch) {
-    ctx.fillStyle = INK.C;
-    for (let a = 0; a < 6.283; a += 0.2) ctx.fillRect(Math.round(hand.x + Math.cos(a) * PINCH.reach), Math.round(hand.y + Math.sin(a) * PINCH.reach), 1, 1);
-  }
+  const hot = hand.pinch && performance.now() - hand.pinchSince < PINCH.hotMs, reach = hand.reach || PINCH.reach;
+  if (hot) { ring(hand.x, hand.y, reach, INK.Y); ring(hand.x, hand.y, reach + 1, INK.k); }
+  else if (!hand.pinch) dottedRing(hand.x, hand.y, reach, INK.C);
 }
 function drawObject(o) {
   const x0 = Math.round(o.x), y0 = Math.round(o.y), x1 = Math.round(o.x + o.w), y1 = Math.round(o.y + o.h), n = 5;
@@ -651,7 +666,7 @@ function drawObject(o) {
 let toolsHeight = 54;                                       // measured, because the buttons wrap on narrow screens
 setInterval(() => { const box = $("#tools"); toolsHeight = box.hidden ? 0 : box.getBoundingClientRect().height; }, 1000);
 const bottomLine = () => LH - Math.ceil((toolsHeight + 10) / pixel) - 8;   // lowest text row that the buttons do not cover
-// e.g. "H12 F18 OC140 28FPS": milliseconds per run for hand, face, object; C = on the CPU, - = switched off
+// e.g. "HC30 FC28 OC120 28FPS": milliseconds per run for hand, face, object; C = on the CPU, - = switched off
 function drawReadout() {
   if (!detectors) return;
   const parts = [["H", "hand"], ["F", "face"], ["O", "object"]].map(([letter, name]) => {
@@ -718,7 +733,7 @@ function drawGameOver() {
   drawText("GAME OVER", LW / 2, LH / 2 - 22, INK.R, "center");
   drawText(`SCORE ${game.score}`, LW / 2, LH / 2 - 8, INK.Y, "center");
   drawText(game.score >= game.hi && game.score > 0 ? "NEUER REKORD!" : `HI ${game.hi}`, LW / 2, LH / 2 + 4, INK.W, "center");
-  drawText("KNEIFEN = NEUSTART", LW / 2, LH / 2 + 18, INK.C, "center");
+  drawText("KNEIFEN ODER TIPPEN", LW / 2, LH / 2 + 18, INK.C, "center");
 }
 function render(t) {
   if (game.demo) drawDemoBackdrop(t); else if (video.readyState >= 2) drawCameraFrame();
@@ -835,9 +850,11 @@ $("#infocopy").addEventListener("click", async () => {
 });
 $("#palette").addEventListener("click", () => { paletteIndex = (paletteIndex + 1) % PALETTES.length; });
 $("#sound").addEventListener("click", () => { muted = !muted; $("#sound").textContent = muted ? "Ton an" : "Ton aus"; });
-screen.addEventListener("click", () => {
-  if (game.mode === "over" && performance.now() - game.overAt > 800) resetGame();
+screen.addEventListener("pointerdown", event => {
+  const box = screen.getBoundingClientRect();
+  if (game.mode === "over") { if (performance.now() - game.overAt > 800) resetGame(); }
   else if (game.mode === "scan") nextTarget();
+  else if (game.mode === "play") taps.push({ x: (event.clientX - box.left) / pixel, y: (event.clientY - box.top) / pixel });
 });
 addEventListener("keydown", e => {
   if (e.key === "p" || e.key === "P") $("#palette").click();
@@ -845,7 +862,7 @@ addEventListener("keydown", e => {
   if (e.key === " " && game.mode === "over") resetGame();
 });
 if (settings.stuck && DETECTOR_NAMES[settings.stuck]) {
-  report(`Beim letzten Start hing die ${DETECTOR_NAMES[settings.stuck]}. Sie ${settings.off.has(settings.stuck) ? "ist jetzt abgeschaltet" : "läuft jetzt ohne Grafikchip"}.`);
+  report(`Beim letzten Start hing die ${DETECTOR_NAMES[settings.stuck]}. Sie ${settings.off.has(settings.stuck) ? "ist jetzt abgeschaltet" : "läuft jetzt auf der CPU"}.`);
 }
 if (location.hash === "#demo") enterGame(true);
 if (location.hash === "#scan") { enterGame(true); resetScanner(); }           // layout check for the scanner HUD
