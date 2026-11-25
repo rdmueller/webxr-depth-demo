@@ -107,7 +107,7 @@
 // ---------------------------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------------------------
-const VERSION = "1.3.0";                                   // shown on the start card, raise by hand on every change
+const VERSION = "1.3.1";                                   // shown on the start card, raise by hand on every change
 document.querySelector("#version").textContent = "Version " + VERSION;
 const query = new URLSearchParams(location.search);
 // Self-hosting: pass ?mp=<folder with vision_bundle.mjs and wasm/> and ?models=<folder with the three model files>.
@@ -308,6 +308,7 @@ function ditherToPalette() {
 // ---------------------------------------------------------------------------------------------
 const input = { face: null, faceSeen: 0, hands: [], objects: [] };
 const pinchMemory = [];
+const stats = { handRuns: 0, handSeen: 0, handLast: 0, minGap3d: Infinity, minGap2d: Infinity, pinches: 0, byPinch: 0, byTap: 0 };
 // A pinch closes below either "close" value and opens again above both "open" values. reach: catch radius in game pixels,
 // hotMs: how long a fresh pinch keeps catching.
 const PINCH = { closeMetres: 0.035, openMetres: 0.055, closeRatio: 0.32, openRatio: 0.5, reach: 22, hotMs: 500 };
@@ -420,6 +421,8 @@ function readHands(result, now) {
     const was = pinchMemory[i] || { down: false, since: 0 };
     const down = was.down ? !open : closed;                                   // hysteresis against flicker
     pinchMemory[i] = { down, since: down && !was.down ? now : was.since };
+    if (down && !was.down) stats.pinches++;
+    stats.minGap3d = Math.min(stats.minGap3d, gap3d); stats.minGap2d = Math.min(stats.minGap2d, gap2d);
     return { pts, thumb: pts[4], index: pts[8], x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2,
              pinch: down, pinchSince: pinchMemory[i].since, gap2d, gap3d, reach: Math.max(PINCH.reach, palm * 0.6) };
   });
@@ -454,7 +457,11 @@ function pickDetector(now) {
   return detectors.hand ? "hand" : null;
 }
 function applyResult(name, result, now) {
-  if (name === "hand") input.hands = readHands(result, now);
+  if (name === "hand") {
+    input.hands = readHands(result, now);
+    stats.handRuns++;
+    if (input.hands.length) { stats.handSeen++; stats.handLast = now; }
+  }
   else if (name === "object") input.objects = readObjects(result);
   else {
     const face = readFace(result, input.face);
@@ -594,9 +601,9 @@ function update(dt, now) {
     bug.x += Math.cos(a) * bug.speed * slow * dt; bug.y += Math.sin(a) * bug.speed * slow * dt; bug.dy = dy;
     for (const hand of input.hands) {
       if (!bug.dead && hand.pinch && now - hand.pinchSince < PINCH.hotMs
-          && Math.hypot(hand.x - bug.x, hand.y - bug.y) < (hand.reach || PINCH.reach)) squash(bug);
+          && Math.hypot(hand.x - bug.x, hand.y - bug.y) < (hand.reach || PINCH.reach)) { squash(bug); stats.byPinch++; }
     }
-    for (const tap of taps) if (!bug.dead && Math.hypot(tap.x - bug.x, tap.y - bug.y) < 16) squash(bug);
+    for (const tap of taps) if (!bug.dead && Math.hypot(tap.x - bug.x, tap.y - bug.y) < 16) { squash(bug); stats.byTap++; }
     if (!bug.dead && d < biteRadius(face) + 3) {
       bug.dead = true; burst(bug.x, bug.y, [INK.R, INK.W, INK.M], 16);
       if (game.safe === 0) { game.hearts--; game.safe = 1.2; game.shake = 0.35; game.flash = 0.25; SFX.hit(); }
@@ -674,6 +681,8 @@ function drawReadout() {
     return d ? `${letter}${d.delegate === "CPU" ? "C" : ""}${Math.round(d.ms)}` : `${letter}-`;
   });
   drawText(`${parts.join(" ")} ${Math.round(fps)}FPS`, 3, bottomLine(), INK.A);
+  if (detectors.hand) drawText(input.hands.length ? `HAND ${input.hands.length}  GRIFFE ${stats.pinches}` : "KEINE HAND", 3, bottomLine() - 10,
+                               input.hands.length ? INK.C : INK.A);
 }
 let lastError = null;
 const problems = [];                                        // full texts for the info panel, repeated lines are counted
@@ -695,7 +704,12 @@ function infoText() {
     const d = detectors && detectors[name];
     lines.push(d ? `${name}: ${d.delegate}, ${d.ms.toFixed(1)} ms, ${d.calls} Läufe, ${d.fails} Fehler in Folge` : `${name}: aus`);
   }
-  lines.push(input.hands.length ? "" : "Keine Hand im Bild.");
+  lines.push("", `Hand gesehen: in ${stats.handSeen} von ${stats.handRuns} Läufen` +
+    (stats.handLast ? `, zuletzt vor ${((performance.now() - stats.handLast) / 1000).toFixed(1)} s` : ""),
+    `Kleinster Fingerabstand: ${Number.isFinite(stats.minGap3d) ? (stats.minGap3d * 100).toFixed(1) + " cm" : "?"}, ` +
+    `Verhältnis ${Number.isFinite(stats.minGap2d) ? stats.minGap2d.toFixed(2) : "?"}`,
+    `Griffe erkannt: ${stats.pinches}, Bugs per Griff: ${stats.byPinch}, per Tippen: ${stats.byTap}`,
+    input.hands.length ? "Gerade im Bild:" : "Gerade keine Hand im Bild.");
   input.hands.forEach((h, i) => lines.push(`Hand ${i + 1}: Abstand ${Number.isFinite(h.gap3d) ? (h.gap3d * 100).toFixed(1) + " cm" : "?"}, ` +
     `Verhältnis ${h.gap2d === undefined ? "?" : h.gap2d.toFixed(2)}, Kneifen ${h.pinch ? "ja" : "nein"}`));
   lines.push(`Gemerkt: CPU [${[...settings.cpu]}], aus [${[...settings.off]}]`, "", problems.length ? "Meldungen:" : "Keine Meldungen.");
@@ -716,7 +730,7 @@ function drawScannerHud() {
   const label = `SUCHE: ${LABELS_DE[game.target] || game.target}`;
   ctx.fillStyle = "rgba(17,10,48,.7)"; ctx.fillRect(0, 14, LW, 13);
   drawText(label, LW / 2, 17, INK.Y, "center");
-  drawText("TIPPEN = WEITER", LW / 2, bottomLine() - 11, INK.A, "center");
+  drawText("TIPPEN = WEITER", LW / 2, bottomLine() - 21, INK.A, "center");
 }
 function drawHud(t) {
   if (game.mode === "scan") return drawScannerHud();
@@ -725,8 +739,8 @@ function drawHud(t) {
   ctx.drawImage(DOC, 3, 13); drawText(`X${String(game.docCount).padStart(2, "0")}`, 14, 15, INK.W);
   drawText(`HI ${String(game.hi).padStart(6, "0")}`, LW - 4, 15, INK.L, "right");
   if (game.boost > 0) { ctx.drawImage(CUP, 3, 25); drawText(`KAFFEE ${Math.ceil(game.boost)}`, 14, 26, INK.C); }
-  if (game.mode === "play" && !input.face && Math.floor(t * 2) % 2) drawText("GESICHT FEHLT", LW / 2, bottomLine() - 11, INK.R, "center");
-  if (game.demo) drawText("DEMO", LW / 2, bottomLine() - 11, INK.A, "center");
+  if (game.mode === "play" && !input.face && Math.floor(t * 2) % 2) drawText("GESICHT FEHLT", LW / 2, bottomLine() - 21, INK.R, "center");
+  if (game.demo) drawText("DEMO", LW / 2, bottomLine() - 21, INK.A, "center");
 }
 function drawGameOver() {
   ctx.fillStyle = "rgba(17,10,48,.6)"; ctx.fillRect(0, LH / 2 - 30, LW, 60);
@@ -769,7 +783,7 @@ function tick(now) {
   try { drawError(now); } catch { /* nothing left to try */ }
 }
 requestAnimationFrame(tick);
-window.bugHunt = { game, input, settings, problems, get detectors() { return detectors; } };                          // handy in the console
+window.bugHunt = { game, input, settings, problems, stats, get detectors() { return detectors; } };                          // handy in the console
 
 // ---------------------------------------------------------------------------------------------
 // Start-up and controls
